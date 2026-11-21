@@ -15,8 +15,7 @@ import {
 import PdfSidebar from "./components/PdfSidebar";
 import ComparisonChatTurn from "./components/ComparisonChatTurn";
 
-const API_BASE_URL =
-  import.meta.env.VITE_API_BASE_URL || "http://localhost:8000";
+const API_BASE_URL = import.meta.env.VITE_API_BASE_URL ?? "";
 
 const QUICK_PROMPTS = [
   "What is the Tech Stack Overview?",
