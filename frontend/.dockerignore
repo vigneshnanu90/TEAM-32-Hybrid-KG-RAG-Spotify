@@ -1,0 +1,25 @@
+# Dependencies & build output (built fresh inside Docker stage 1)
+node_modules/
+dist/
+build/
+
+# Logs & caches
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.vite/
+.eslintcache
+
+# Local environment overrides
+.env
+.env.local
+.env.*.local
+
+# Git, IDE & OS files
+.git/
+.gitignore
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+README.md
