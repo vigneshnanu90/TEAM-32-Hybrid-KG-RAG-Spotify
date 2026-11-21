@@ -16,6 +16,6 @@ jobs:
           username: ${{ secrets.VPS_USER }}
           password: ${{ secrets.VPS_PASSWORD }}
           script: |
-            cd /opt/apps/Hybrid-Rag-Framework
+            cd /opt/apps/TEAM-32-Hybrid-KG-RAG-Spotify
             git pull origin main
             docker compose up --build -d
