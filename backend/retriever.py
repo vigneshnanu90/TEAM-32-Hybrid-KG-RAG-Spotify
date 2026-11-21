@@ -3,6 +3,8 @@ from typing import Any
 
 from openai import AsyncOpenAI
 from pydantic import BaseModel
+
+from config import settings
 from ingest import (
     build_bm25_index,
     load_bm25_records,
@@ -10,9 +12,9 @@ from ingest import (
     neo4j_driver,
     tokenize,
 )
-from config import settings
 
 client = AsyncOpenAI(api_key=settings.openai_api_key)
+DEFAULT_TEMPERATURE = 0.5
 
 
 class SectionAnswer(BaseModel):
@@ -31,7 +33,6 @@ def _vector_and_bm25_search(query: str, top_k: int = 5) -> list[dict[str, Any]]:
     doc_map: dict[str, dict[str, Any]] = {}
     rrf_k = 60
 
-    # Dense FAISS search
     store = load_faiss_store()
     if store is not None:
         faiss_hits = store.similarity_search(query, k=top_k)
@@ -39,13 +40,12 @@ def _vector_and_bm25_search(query: str, top_k: int = 5) -> list[dict[str, Any]]:
             cid = doc.metadata.get("chunk_id") or f"faiss_{rank}"
             doc_map[cid] = {
                 "chunk_id": cid,
-                "filename": doc.metadata.get("filename", "PDF"),
+                "filename": doc.metadata.get("filename", "Source"),
                 "page": doc.metadata.get("page", "?"),
                 "text": doc.page_content,
             }
             fused_scores[cid] = fused_scores.get(cid, 0.0) + 1.0 / (rrf_k + rank)
 
-    # Sparse BM25 search
     bm25_records = load_bm25_records()
     bm25 = build_bm25_index(bm25_records)
     if bm25 is not None and bm25_records:
@@ -59,8 +59,21 @@ def _vector_and_bm25_search(query: str, top_k: int = 5) -> list[dict[str, Any]]:
             doc_map[cid] = rec
             fused_scores[cid] = fused_scores.get(cid, 0.0) + 1.0 / (rrf_k + rank)
 
-    sorted_ids = sorted(fused_scores.keys(), key=lambda k: fused_scores[k], reverse=True)[:top_k]
-    return [doc_map[cid] for cid in sorted_ids]
+    # Lightweight rerank: boost chunks matching query keywords
+    query_terms = {w for w in tokenize(query) if len(w) > 2}
+    reranked_ids = sorted(
+        fused_scores.keys(),
+        key=lambda cid: fused_scores[cid]
+        + 0.02
+        * sum(
+            1
+            for term in query_terms
+            if term in doc_map[cid].get("text", "").lower()
+        ),
+        reverse=True,
+    )[:top_k]
+
+    return [doc_map[cid] for cid in reranked_ids]
 
 
 def _graph_search(query: str, limit: int = 20) -> list[dict[str, Any]]:
@@ -84,77 +97,88 @@ def _graph_search(query: str, limit: int = 20) -> list[dict[str, Any]]:
         return [dict(record) for record in result]
 
 
+def _build_augmented_prompt(system_prompt: str, user_query: str, retrieved_context: str) -> str:
+    # Follows whiteboard augmentation flow: S.P + U.Q + R.C
+    return (
+        f"[S.P - System Prompt]\n{system_prompt}\n\n"
+        f"[U.Q - User Query]\n{user_query}\n\n"
+        f"[R.C - Retrieved Context]\n{retrieved_context}"
+    )
+
+
 async def _answer_from_vector_bm25(query: str, chunks: list[dict[str, Any]]) -> SectionAnswer:
     if not chunks:
         return SectionAnswer(
-            answer="No matching text passages were found in the indexed PDF chunks.",
+            answer="I could not find matching text passages for this question yet.",
             sources=[],
         )
 
     context_block = "\n\n".join(
-        f"[{c['filename']} - Page {c['page']}]: {c['text']}" for c in chunks
+        f"[Chunk {c.get('chunk_id', 'ref')} | {c.get('filename', 'Source')} p.{c.get('page', '?')}]: {c['text']}"
+        for c in chunks
     )
-    sources = sorted({f"{c['filename']} (p. {c['page']})" for c in chunks})
+    sources = sorted({f"{c.get('filename', 'Source')} (p. {c.get('page', '?')})" for c in chunks})
+
+    system_prompt = (
+        "You are a helpful software architect assistant. Explain answers clearly in plain, "
+        "everyday human language using only the provided text passages. Use short paragraphs or "
+        "simple bullet points when helpful, and avoid raw JSON or robotic phrasing."
+    )
+    augmented_user_msg = _build_augmented_prompt(system_prompt, query, context_block)
 
     resp = await client.beta.chat.completions.parse(
         model=settings.openai_chat_model,
-        temperature=0.2,
+        temperature=DEFAULT_TEMPERATURE,
         response_format=SectionAnswer,
         messages=[
-            {
-                "role": "system",
-                "content": (
-                    "Answer the user's question strictly using the provided Vector+BM25 text passages. "
-                    "Do not invent facts outside the context. Keep sources list concise."
-                ),
-            },
-            {
-                "role": "user",
-                "content": f"Question: {query}\n\nContext:\n{context_block}\n\nSources: {sources}",
-            },
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": augmented_user_msg},
         ],
     )
     parsed = resp.choices[0].message.parsed
-    return parsed or SectionAnswer(answer="Could not synthesize Vector+BM25 answer.", sources=sources)
+    return parsed or SectionAnswer(
+        answer="I could not summarize the matching text passages right now.",
+        sources=sources,
+    )
 
 
 async def _answer_from_graph(query: str, triples: list[dict[str, Any]]) -> SectionAnswer:
     if not triples:
         return SectionAnswer(
-            answer="No matching entity relationships were found in the Neo4j Knowledge Graph.",
+            answer="I could not find matching relationship links for this question yet.",
             sources=[],
         )
 
     triple_lines = [
-        f"({t['subject']}) -[:{t['relation']}]-> ({t['object']}) [Page {t.get('page', '?')}]"
+        f"({t['subject']}) -[{t['relation']}]-> ({t['object']}) [NodeRef p.{t.get('page', '?')}]"
         for t in triples
     ]
-    sources = sorted({f"{t.get('filename', 'PDF')} (p. {t.get('page', '?')})" for t in triples})
+    sources = sorted({f"{t.get('filename', 'Source')} (p. {t.get('page', '?')})" for t in triples})
+
+    system_prompt = (
+        "You are a helpful software architect assistant. Explain how components and concepts "
+        "connect in plain, easy-to-follow language based strictly on the provided relationships."
+    )
+    augmented_user_msg = _build_augmented_prompt(
+        system_prompt,
+        query,
+        "\n".join(triple_lines),
+    )
 
     resp = await client.beta.chat.completions.parse(
         model=settings.openai_chat_model,
-        temperature=0.2,
+        temperature=DEFAULT_TEMPERATURE,
         response_format=SectionAnswer,
         messages=[
-            {
-                "role": "system",
-                "content": (
-                    "Answer the user's question strictly using the provided Knowledge Graph triples. "
-                    "Highlight explicit entities and relationships."
-                ),
-            },
-            {
-                "role": "user",
-                "content": (
-                    f"Question: {query}\n\nGraph Triples:\n"
-                    + "\n".join(triple_lines)
-                    + f"\n\nSources: {sources}"
-                ),
-            },
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": augmented_user_msg},
         ],
     )
     parsed = resp.choices[0].message.parsed
-    return parsed or SectionAnswer(answer="Could not synthesize Graph answer.", sources=sources)
+    return parsed or SectionAnswer(
+        answer="I could not summarize the connected relationships right now.",
+        sources=sources,
+    )
 
 
 async def run_three_section_query(query: str) -> dict[str, Any]:
@@ -168,35 +192,39 @@ async def run_three_section_query(query: str) -> dict[str, Any]:
         _answer_from_graph(query, triples),
     )
 
+    # Combined {Chunks + Node Ref} context for final synthesis
+    chunk_refs = [
+        f"Chunk {c.get('chunk_id', 'ref')}: {c['text'][:240]}" for c in chunks
+    ]
+    node_refs = [
+        f"NodeRef ({t['subject']} -> {t['relation']} -> {t['object']})" for t in triples[:10]
+    ]
+    combined_context = "\n".join(chunk_refs + node_refs) or "No retrieved items."
+
+    judge_system = (
+        "You are a clear, impartial assistant. Compare the two answers in plain human language, "
+        "choose the best approach ('Vector + BM25', 'Knowledge Graph', or 'Hybrid (Both)'), "
+        "and write a clear, easy-to-read `best_answer` grounded in the context."
+    )
+    judge_prompt = _build_augmented_prompt(
+        judge_system,
+        query,
+        f"{combined_context}\n\nOption A (Vector + BM25):\n{vector_sec.answer}\n\nOption B (Knowledge Graph):\n{graph_sec.answer}",
+    )
+
     judge_resp = await client.beta.chat.completions.parse(
         model=settings.openai_chat_model,
-        temperature=0.2,
+        temperature=DEFAULT_TEMPERATURE,
         response_format=JudgeVerdict,
         messages=[
-            {
-                "role": "system",
-                "content": (
-                    "You are an impartial RAG evaluation judge. Compare the Vector+BM25 answer "
-                    "and the Knowledge Graph answer for the user's query:\n"
-                    "1. Explain strengths, gaps, or contradictions between both answers in `comparison`.\n"
-                    "2. Set `winner` to 'Vector + BM25', 'Knowledge Graph', or 'Hybrid (Both)'.\n"
-                    "3. Write `best_answer` combining the most accurate, grounded details."
-                ),
-            },
-            {
-                "role": "user",
-                "content": (
-                    f"User Query: {query}\n\n"
-                    f"--- VECTOR + BM25 ANSWER ---\n{vector_sec.answer}\n\n"
-                    f"--- KNOWLEDGE GRAPH ANSWER ---\n{graph_sec.answer}"
-                ),
-            },
+            {"role": "system", "content": judge_system},
+            {"role": "user", "content": judge_prompt},
         ],
     )
     verdict = judge_resp.choices[0].message.parsed or JudgeVerdict(
-        comparison="Both sections were evaluated.",
+        comparison="Both retrieval paths were reviewed together.",
         winner="Hybrid (Both)",
-        best_answer=vector_sec.answer,
+        best_answer=vector_sec.answer or graph_sec.answer,
     )
 
     return {

@@ -1,16 +1,47 @@
-# React + Vite
+# Spotify Hybrid RAG Framework
 
-This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
+A full-stack retrieval-augmented generation application combining **FAISS** dense vector search, **BM25** lexical retrieval, and **Neo4j** Knowledge Graph relationships behind a **FastAPI** backend and **React + Vite + Tailwind** frontend.
 
-Currently, two official plugins are available:
+## Architecture & Pipeline
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Oxc](https://oxc.rs)
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/)
+- **Data Ingestion & Cleanup (`backend/ingest.py`)**
+  - Extracts text from uploaded `.pdf` documents and splits into chunks.
+  - Indexes embeddings into **FAISS** and token records into **BM25** (`bm25_docs.pkl`) with `doc_id` metadata.
+  - Extracts structured `(subject, relation, object)` triples and stores them in **Neo4j** tagged by `doc_id`.
+  - Deletes a PDF's uploaded file, BM25 records, Neo4j relationships/orphaned entities, and rebuilds or clears the FAISS store when removed.
+- **Guardrails & Hybrid Retrieval (`backend/guardrails.py`, `backend/retriever.py`)**
+  - Validates queries up to `1,000` characters, blocks prompt-injection attempts, and checks index availability.
+  - Combines **FAISS** + **BM25** via Reciprocal Rank Fusion (RRF) with keyword reranking alongside **Neo4j** graph queries.
+  - Augments context (`S.P + U.Q + R.C`) and synthesizes human-readable responses at `temperature=0.5`.
+- **Frontend Workspace (`frontend/src/`)**
+  - Multi-view navigation across **AI Architect Chat**, **Tech Stack & Services**, and **Indexed PDFs**.
+  - Dynamic upload progress percentage (`0%`–`100%`) during PDF uploads and one-click PDF deletion.
+  - Parses structured/escaped responses into readable text and persists session chat history in `sessionStorage`.
 
-## React Compiler
+## Project Structure
 
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
-
-## Expanding the ESLint configuration
-
-If you are developing a production application, we recommend using TypeScript with type-aware lint rules enabled. Check out the [TS template](https://github.com/vitejs/vite/tree/main/packages/create-vite/template-react-ts) for information on how to integrate TypeScript and [`typescript-eslint`](https://typescript-eslint.io) in your project.
+```text
+Hybrid-Rag-Framework/
+├── backend/
+│   ├── guardrails.py
+│   ├── ingest.py
+│   ├── main.py
+│   ├── requirements.txt
+│   └── retriever.py
+├── frontend/
+│   ├── src/
+│   │   ├── components/
+│   │   │   ├── ComparisonChatTurn.jsx
+│   │   │   ├── PdfSidebar.jsx
+│   │   │   └── WorkspaceHeader.jsx
+│   │   ├── views/
+│   │   │   ├── ArchitectureExplorerView.jsx
+│   │   │   └── DocumentManagerView.jsx
+│   │   └── App.jsx
+│   ├── nginx.conf
+│   ├── nginx.local.conf
+│   ├── Dockerfile
+│   └── package.json
+├── docker-compose.yml
+├── docker-compose.override.yml   # Local-only HTTP override (gitignored)
+└── README.md

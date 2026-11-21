@@ -1,282 +1,394 @@
-import React, { useEffect, useRef, useState } from "react";
-import {
-  Send,
-  Loader2,
-  Play,
-  Pause,
-  SkipBack,
-  SkipForward,
-  Volume2,
-  Layers,
-  Server,
-  HardDrive,
-  Sparkles,
-} from "lucide-react";
+import React, { useCallback, useEffect, useState } from "react";
+import WorkspaceHeader from "./components/WorkspaceHeader";
 import PdfSidebar from "./components/PdfSidebar";
 import ComparisonChatTurn from "./components/ComparisonChatTurn";
+import ArchitectureExplorerView from "./views/ArchitectureExplorerView";
+import DocumentManagerView from "./views/DocumentManagerView";
 
-const API_BASE_URL = import.meta.env.VITE_API_BASE_URL ?? "";
+const SESSION_STORAGE_KEY = "spotify_architect_rag_turns_v1";
+const MAX_PROMPT_CHARS = 1000;
 
-const QUICK_PROMPTS = [
-  "What is the Tech Stack Overview?",
-  "List all 17 microservices and their roles",
-  "How is data stored across PostgreSQL, Redis, Elasticsearch, and ClickHouse?",
-  "What are the main Frontend routes and global UI components?",
-];
+function extractReadableText(section) {
+  if (!section) return "";
 
-const ARCHITECTURE_CARDS = [
-  {
-    title: "Frontend Stack",
-    subtitle: "Next.js • React + TS • Tailwind • Zustand • HLS.js",
-    icon: Layers,
-  },
-  {
-    title: "Backend & Bus",
-    subtitle: "Node.js + TS • NestJS • REST & gRPC / Kafka • API Gateway",
-    icon: Server,
-  },
-  {
-    title: "Databases & CDN",
-    subtitle: "PostgreSQL • Redis • OpenSearch • ClickHouse • S3 + CDN",
-    icon: HardDrive,
-  },
-];
+  let parsed = section;
+  if (typeof section === "string") {
+    const trimmed = section.trim();
+    if (trimmed.startsWith("{") && trimmed.endsWith("}")) {
+      try {
+        parsed = JSON.parse(trimmed);
+      } catch {
+        parsed = section;
+      }
+    }
+  }
+
+  let rawText = "";
+  if (typeof parsed === "string") {
+    rawText = parsed;
+  } else if (parsed && typeof parsed === "object") {
+    rawText =
+      parsed.answer ||
+      parsed.summary ||
+      parsed.response ||
+      parsed.text ||
+      "";
+  }
+
+  return String(rawText)
+    .replace(/\\n/g, "\n")
+    .replace(/\*\*/g, "")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
+function uploadPdfWithProgress(file, onProgress) {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open("POST", "/api/upload-pdf");
+
+    xhr.upload.onprogress = (event) => {
+      if (event.lengthComputable && typeof onProgress === "function") {
+        const pct = Math.min(100, Math.round((event.loaded / event.total) * 100));
+        onProgress(pct);
+      }
+    };
+
+    xhr.onload = () => {
+      let data = {};
+      try {
+        data = JSON.parse(xhr.responseText || "{}");
+      } catch {
+        data = {};
+      }
+      if (xhr.status >= 200 && xhr.status < 300) {
+        if (typeof onProgress === "function") onProgress(100);
+        resolve(data);
+      } else {
+        reject(new Error(data.detail || data.message || `Upload failed (${xhr.status})`));
+      }
+    };
+
+    xhr.onerror = () => reject(new Error("Network error while uploading PDF."));
+
+    const formData = new FormData();
+    formData.append("file", file);
+    xhr.send(formData);
+  });
+}
 
 export default function App() {
-  const [activeNav, setActiveNav] = useState("chat");
+  const [activeView, setActiveView] = useState("chat");
+  const [retrievalMode, setRetrievalMode] = useState("hybrid");
+  const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
+
   const [documents, setDocuments] = useState([]);
-  const [turns, setTurns] = useState([]);
-  const [input, setInput] = useState("");
-  const [sending, setSending] = useState(false);
-  const [playing, setPlaying] = useState(true);
-  const endRef = useRef(null);
+  const [isUploading, setIsUploading] = useState(false);
+  const [uploadProgress, setUploadProgress] = useState(0);
+  const [deletingDocId, setDeletingDocId] = useState(null);
+  const [statusMessage, setStatusMessage] = useState("");
+
+  const [promptInput, setPromptInput] = useState("");
+  const [isSending, setIsSending] = useState(false);
+  const [inputError, setInputError] = useState("");
+  const [turns, setTurns] = useState(() => {
+    try {
+      const saved = sessionStorage.getItem(SESSION_STORAGE_KEY);
+      return saved ? JSON.parse(saved) : [];
+    } catch {
+      return [];
+    }
+  });
+
+  const refreshDocuments = useCallback(async () => {
+    try {
+      const res = await fetch("/api/documents");
+      if (!res.ok) return;
+      const data = await res.json();
+      if (Array.isArray(data.documents)) {
+        setDocuments(data.documents);
+      }
+    } catch {
+      // Ignore transient network errors
+    }
+  }, []);
 
   useEffect(() => {
-    endRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [turns, sending]);
+    refreshDocuments();
+  }, [refreshDocuments]);
 
-  const submitQuery = async (questionText) => {
-    const text = questionText.trim();
-    if (!text || sending) return;
+  useEffect(() => {
+    try {
+      sessionStorage.setItem(SESSION_STORAGE_KEY, JSON.stringify(turns));
+    } catch {
+      // Ignore storage errors
+    }
+  }, [turns]);
 
-    const timestamp = new Date().toLocaleTimeString([], {
-      hour: "2-digit",
-      minute: "2-digit",
-      hour12: false,
-    });
+  const handleUploadPdf = async (file) => {
+    setIsUploading(true);
+    setUploadProgress(0);
+    setStatusMessage("");
+    try {
+      const summary = await uploadPdfWithProgress(file, (pct) => {
+        setUploadProgress(pct);
+      });
+      await refreshDocuments();
+      setStatusMessage(
+        `Indexed "${summary.filename || file.name}" (${summary.chunks_indexed || 0} chunks, ${summary.triples_stored || 0} graph links).`
+      );
+    } catch (err) {
+      setStatusMessage(err.message || "Unable to upload PDF.");
+    } finally {
+      setIsUploading(false);
+      setTimeout(() => setUploadProgress(0), 600);
+    }
+  };
 
-    setActiveNav("chat");
+  const handleDeleteDocument = async (docId) => {
+    if (!docId) return;
+    setDeletingDocId(docId);
+    setStatusMessage("");
+    try {
+      const res = await fetch(`/api/documents/${encodeURIComponent(docId)}`, {
+        method: "DELETE",
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        throw new Error(data.detail || `Delete failed (${res.status})`);
+      }
+      setDocuments((prev) => prev.filter((d) => d.doc_id !== docId));
+      setStatusMessage("Deleted PDF and removed its indexed vector, keyword, and graph data.");
+    } catch (err) {
+      setStatusMessage(err.message || "Unable to delete PDF.");
+    } finally {
+      setDeletingDocId(null);
+    }
+  };
+
+  const submitQuestion = async (rawQuestion) => {
+    const cleaned = (rawQuestion || "").trim();
+    if (!cleaned) {
+      setInputError("Enter a question before sending.");
+      return;
+    }
+    if (cleaned.length > MAX_PROMPT_CHARS) {
+      setInputError(`Question must be ${MAX_PROMPT_CHARS} characters or fewer.`);
+      return;
+    }
+
+    setInputError("");
+    setActiveView("chat");
+    setIsSending(true);
+    setPromptInput("");
+
+    const turnId = `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
     setTurns((prev) => [
       ...prev,
-      { id: `u-${Date.now()}`, role: "user", timestamp, text },
+      {
+        id: turnId,
+        question: cleaned,
+        mode: retrievalMode,
+        answer: "",
+        loading: true,
+      },
     ]);
-    setInput("");
-    setSending(true);
 
     try {
-      const res = await fetch(`${API_BASE_URL}/api/chat`, {
+      const res = await fetch("/api/chat", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ query: text, session_id: "spotify-arch-rag" }),
+        body: JSON.stringify({
+          query: cleaned,
+          mode: retrievalMode,
+        }),
       });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.detail || "Request failed.");
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        throw new Error(data.detail || data.message || `Request failed (${res.status})`);
+      }
 
       if (data.blocked) {
-        setTurns((prev) => [
-          ...prev,
-          {
-            id: `a-${Date.now()}`,
-            role: "assistant",
-            blocked: true,
-            guardrail_reason: data.guardrail_reason,
-          },
-        ]);
-      } else {
-        setTurns((prev) => [
-          ...prev,
-          {
-            id: `a-${Date.now()}`,
-            role: "assistant",
-            best_answer: data.comparison_section?.best_answer || "",
-            comparison_section: data.comparison_section,
-            vector_section: data.vector_section,
-            graph_section: data.graph_section,
-          },
-        ]);
+        setTurns((prev) =>
+          prev.map((t) =>
+            t.id === turnId
+              ? {
+                  ...t,
+                  answer: data.guardrail_reason || "Query was blocked by input guardrails.",
+                  error: true,
+                  loading: false,
+                }
+              : t
+          )
+        );
+        return;
       }
+
+      const vectorText = extractReadableText(data.vector_section);
+      const graphText = extractReadableText(data.graph_section);
+      const comparisonText = extractReadableText(data.comparison_section);
+      const directAnswer = extractReadableText(data.answer || data.response);
+
+      const sections = [
+        vectorText && { label: "Vector & Keyword Match", content: vectorText },
+        graphText && { label: "Connected Architecture", content: graphText },
+        comparisonText && { label: "Key Takeaway", content: comparisonText },
+      ].filter(Boolean);
+
+      const combinedAnswer =
+        directAnswer ||
+        sections.map((s) => `${s.label}:\n${s.content}`).join("\n\n") ||
+        "No response content was returned for this query.";
+
+      setTurns((prev) =>
+        prev.map((t) =>
+          t.id === turnId
+            ? {
+                ...t,
+                answer: combinedAnswer,
+                sections,
+                loading: false,
+              }
+            : t
+        )
+      );
     } catch (err) {
-      setTurns((prev) => [
-        ...prev,
-        {
-          id: `a-${Date.now()}`,
-          role: "assistant",
-          blocked: true,
-          guardrail_reason:
-            err.message || "Could not reach FastAPI server on port 8000.",
-        },
-      ]);
+      setTurns((prev) =>
+        prev.map((t) =>
+          t.id === turnId
+            ? {
+                ...t,
+                answer: `Unable to fetch response: ${err.message}`,
+                error: true,
+                loading: false,
+              }
+            : t
+        )
+      );
     } finally {
-      setSending(false);
+      setIsSending(false);
+    }
+  };
+
+  const handleClearChat = () => {
+    setTurns([]);
+    setInputError("");
+    try {
+      sessionStorage.removeItem(SESSION_STORAGE_KEY);
+    } catch {
+      // Ignore storage errors
     }
   };
 
   return (
-    <div className="h-screen w-screen overflow-hidden bg-[#000000] text-zinc-100 flex flex-col">
-      {/* Main Split Workspace */}
-      <div className="flex-1 flex min-h-0">
-        <PdfSidebar
-          apiBaseUrl={API_BASE_URL}
-          documents={documents}
-          activeNav={activeNav}
-          onSelectNav={setActiveNav}
-          onUploadSuccess={(doc) => setDocuments((prev) => [doc, ...prev])}
+    <div className="flex min-h-screen bg-[#06100b] text-slate-100">
+      <PdfSidebar
+        activeView={activeView}
+        onSelectView={(view) => {
+          setActiveView(view);
+          setMobileMenuOpen(false);
+        }}
+        documents={documents}
+        isUploading={isUploading}
+        uploadProgress={uploadProgress}
+        deletingDocId={deletingDocId}
+        onUploadPdf={handleUploadPdf}
+        onDeleteDocument={handleDeleteDocument}
+        mobileOpen={mobileMenuOpen}
+        onCloseMobile={() => setMobileMenuOpen(false)}
+      />
+
+      <div className="flex min-w-0 flex-1 flex-col">
+        <WorkspaceHeader
+          activeView={activeView}
+          retrievalMode={retrievalMode}
+          onChangeMode={setRetrievalMode}
+          onClearChat={handleClearChat}
+          onOpenMobileMenu={() => setMobileMenuOpen(true)}
         />
 
-        {/* Center Spotify Content + Hybrid RAG Chat Panel */}
-        <main className="flex-1 my-2 mr-2 rounded-xl bg-gradient-to-b from-[#1f3b28] via-[#121212] to-[#121212] flex flex-col min-w-0 overflow-hidden">
-          {/* Compact Single-Row Header */}
-          <header className="px-5 py-3 border-b border-white/10 flex items-center justify-between gap-4 shrink-0">
-            <div className="flex items-center gap-2.5 min-w-0">
-              <h1 className="text-sm sm:text-base font-bold text-white truncate">
-                Spotify Architecture RAG
-              </h1>
-              <span className="text-[10px] font-bold uppercase px-2 py-0.5 rounded-full bg-[#1DB954] text-black shrink-0">
-                Hybrid
-              </span>
-            </div>
+        <main className="flex-1 overflow-y-auto">
+          {activeView === "chat" && (
+            <div className="mx-auto flex h-full max-w-5xl flex-col justify-between px-4 py-6 md:px-6">
+              {turns.length === 0 ? (
+                <div className="my-auto space-y-2 py-8 text-center">
+                  <h2 className="text-xl font-semibold text-white">
+                    AI Architect Chat
+                  </h2>
+                  <p className="mx-auto max-w-xl text-sm text-emerald-200/75">
+                    Upload a PDF in the sidebar or Indexed PDFs view, then ask your question.
+                  </p>
+                </div>
+              ) : (
+                <div className="space-y-5 pb-6">
+                  {turns.map((turn) => (
+                    <ComparisonChatTurn key={turn.id} turn={turn} />
+                  ))}
+                </div>
+              )}
 
-            <div className="flex items-center gap-1.5 overflow-x-auto">
-              {QUICK_PROMPTS.map((q) => (
-                <button
-                  key={q}
-                  type="button"
-                  onClick={() => submitQuery(q)}
-                  className="text-[11px] px-2.5 py-1 rounded-full bg-white/10 hover:bg-white/20 text-zinc-200 whitespace-nowrap transition shrink-0"
-                >
-                  {q}
-                </button>
-              ))}
-            </div>
-          </header>
-
-          {/* Body: Architecture Overview Cards (when selected) + Chat Stream */}
-          <div className="flex-1 overflow-y-auto px-6 py-5 space-y-6">
-            {activeNav === "stack" && (
-              <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-                {ARCHITECTURE_CARDS.map(({ title, subtitle, icon: Icon }) => (
-                  <div
-                    key={title}
-                    className="bg-[#181818] hover:bg-[#222222] border border-white/5 rounded-xl p-4 space-y-2 transition"
+              <form
+                onSubmit={(e) => {
+                  e.preventDefault();
+                  submitQuestion(promptInput);
+                }}
+                className="sticky bottom-0 z-10 border-t border-emerald-900/60 bg-[#06100b]/95 pt-3 pb-2 backdrop-blur"
+              >
+                <div className="flex items-center gap-2 rounded-xl border border-emerald-800/70 bg-[#0b1d14] p-2">
+                  <input
+                    type="text"
+                    value={promptInput}
+                    maxLength={MAX_PROMPT_CHARS}
+                    disabled={isSending}
+                    onChange={(e) => {
+                      setPromptInput(e.target.value);
+                      if (inputError) setInputError("");
+                    }}
+                    placeholder="Ask a question about your uploaded PDF..."
+                    className="w-full bg-transparent px-2 py-1.5 text-sm text-white placeholder-emerald-200/45 focus:outline-none"
+                  />
+                  <button
+                    type="submit"
+                    disabled={isSending || !promptInput.trim()}
+                    className="shrink-0 rounded-lg bg-emerald-500 px-4 py-2 text-xs font-semibold text-slate-950 transition hover:bg-emerald-400 disabled:cursor-not-allowed disabled:opacity-50"
                   >
-                    <div className="w-10 h-10 rounded-lg bg-[#1DB954]/20 text-[#1DB954] flex items-center justify-center">
-                      <Icon className="w-5 h-5" />
-                    </div>
-                    <h3 className="text-sm font-bold text-white">{title}</h3>
-                    <p className="text-xs text-zinc-400 leading-relaxed">
-                      {subtitle}
-                    </p>
-                  </div>
-                ))}
-              </div>
-            )}
+                    {isSending ? "Sending..." : "Send"}
+                  </button>
+                </div>
+                <div className="mt-1.5 flex items-center justify-between px-1 text-[11px] text-emerald-200/55">
+                  <span>
+                    {inputError ? (
+                      <span className="text-rose-400">{inputError}</span>
+                    ) : (
+                      `Mode: ${retrievalMode}`
+                    )}
+                  </span>
+                  <span>
+                    {promptInput.length}/{MAX_PROMPT_CHARS}
+                  </span>
+                </div>
+              </form>
+            </div>
+          )}
 
-            {turns.length === 0 ? (
-              <div className="py-12 text-center max-w-xl mx-auto space-y-3">
-                <Sparkles className="w-8 h-8 text-[#1DB954] mx-auto" />
-                <h2 className="text-base font-bold text-white">
-                  Upload your PDF &amp; ask any architecture question
-                </h2>
-                <p className="text-xs text-zinc-400 leading-relaxed">
-                  Click one of the quick prompt pills in the header or type a
-                  question below to compare Vector DB + BM25 against Knowledge
-                  Graph retrieval.
-                </p>
-              </div>
-            ) : (
-              turns.map((turn) => (
-                <ComparisonChatTurn key={turn.id} turn={turn} />
-              ))
-            )}
+          {activeView === "architecture" && (
+            <ArchitectureExplorerView onAskPrompt={submitQuestion} />
+          )}
 
-            {sending && (
-              <div className="flex items-center gap-2 text-xs text-zinc-300 pl-11">
-                <Loader2 className="w-4 h-4 animate-spin text-[#1DB954]" />
-                <span>
-                  Retrieving from FAISS + BM25 and Neo4j Knowledge Graph...
-                </span>
-              </div>
-            )}
-            <div ref={endRef} />
-          </div>
-
-          {/* Bottom Chat Composer */}
-          <form
-            onSubmit={(e) => {
-              e.preventDefault();
-              submitQuery(input);
-            }}
-            className="px-6 py-3.5 bg-[#181818] border-t border-white/10 flex items-center gap-3 shrink-0"
-          >
-            <input
-              type="text"
-              value={input}
-              onChange={(e) => setInput(e.target.value)}
-              placeholder="Ask about Next.js, NestJS, microservices, storage, or features..."
-              disabled={sending}
-              className="flex-1 bg-[#242424] focus:bg-[#2a2a2a] border border-transparent focus:border-[#1DB954] rounded-full px-4 py-2.5 text-sm text-white placeholder:text-zinc-400 focus:outline-none transition"
+          {activeView === "documents" && (
+            <DocumentManagerView
+              documents={documents}
+              isUploading={isUploading}
+              uploadProgress={uploadProgress}
+              deletingDocId={deletingDocId}
+              statusMessage={statusMessage}
+              onUploadPdf={handleUploadPdf}
+              onDeleteDocument={handleDeleteDocument}
+              onBackToChat={() => setActiveView("chat")}
             />
-            <button
-              type="submit"
-              disabled={!input.trim() || sending}
-              className="px-5 py-2.5 rounded-full bg-[#1DB954] hover:bg-[#1ed760] disabled:opacity-40 text-black text-xs font-bold inline-flex items-center gap-1.5 transition"
-            >
-              <Send className="w-3.5 h-3.5" />
-              <span>Send</span>
-            </button>
-          </form>
+          )}
         </main>
       </div>
-
-      {/* Persistent Spotify-Style Bottom Player / Telemetry Bar */}
-      <footer className="h-16 bg-[#000000] border-t border-white/10 px-4 flex items-center justify-between shrink-0">
-        <div className="flex items-center gap-3 min-w-0">
-          <div className="w-10 h-10 rounded bg-gradient-to-br from-[#1DB954] to-emerald-900 flex items-center justify-center text-black font-bold text-xs shrink-0">
-            RAG
-          </div>
-          <div className="min-w-0">
-            <p className="text-xs font-semibold text-white truncate">
-              {documents[0]?.name || "No PDF Loaded"}
-            </p>
-            <p className="text-[11px] text-zinc-400 truncate">
-              FAISS + BM25 + Neo4j GraphRAG Pipeline
-            </p>
-          </div>
-        </div>
-
-        <div className="flex items-center gap-4">
-          <SkipBack className="w-4 h-4 text-zinc-400 hover:text-white cursor-pointer" />
-          <button
-            type="button"
-            onClick={() => setPlaying((p) => !p)}
-            className="w-8 h-8 rounded-full bg-white text-black flex items-center justify-center hover:scale-105 transition"
-          >
-            {playing ? (
-              <Pause className="w-4 h-4" />
-            ) : (
-              <Play className="w-4 h-4 ml-0.5" />
-            )}
-          </button>
-          <SkipForward className="w-4 h-4 text-zinc-400 hover:text-white cursor-pointer" />
-        </div>
-
-        <div className="hidden sm:flex items-center gap-2 text-xs text-zinc-400">
-          <Volume2 className="w-4 h-4" />
-          <div className="w-24 h-1 rounded-full bg-zinc-700 overflow-hidden">
-            <div className="w-3/4 h-full bg-[#1DB954]" />
-          </div>
-        </div>
-      </footer>
     </div>
   );
 }
