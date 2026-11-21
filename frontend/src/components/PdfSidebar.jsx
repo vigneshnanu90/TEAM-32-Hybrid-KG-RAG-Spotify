@@ -40,8 +40,15 @@ export default function PdfSidebar({
         method: "POST",
         body: formData,
       });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.detail || "Upload failed.");
+      const rawText = await res.text();
+      let data = {};
+      try {
+        data = rawText ? JSON.parse(rawText) : {};
+      } catch {
+        throw new Error(`Server returned HTTP ${res.status} (non-JSON response).`);
+      }
+
+      if (!res.ok) throw new Error(data.detail || `Upload failed (HTTP ${res.status}).`);
 
       onUploadSuccess?.({
         id: data.doc_id,
