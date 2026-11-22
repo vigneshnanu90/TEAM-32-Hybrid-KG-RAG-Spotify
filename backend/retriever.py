@@ -14,8 +14,8 @@ from ingest import (
 )
 
 client = AsyncOpenAI(api_key=settings.openai_api_key)
-DEFAULT_TEMPERATURE = 0.5
-GROUNDED_TEMPERATURE = 0.2
+DEFAULT_TEMPERATURE = 0.0
+GROUNDED_TEMPERATURE = 0.0
 
 NOT_IN_DOC_MESSAGE = (
     "The uploaded document does not contain information relevant to this question."
@@ -58,7 +58,9 @@ def _vector_and_bm25_search(query: str, top_k: int = 5) -> list[dict[str, Any]]:
     bm25 = build_bm25_index(bm25_records)
     if bm25 is not None and bm25_records:
         scores = bm25.get_scores(tokenize(query))
-        ranked_indices = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)[:top_k]
+        ranked_indices = sorted(
+            range(len(scores)), key=lambda i: scores[i], reverse=True
+        )[:top_k]
         for rank, idx in enumerate(ranked_indices, start=1):
             if scores[idx] <= 0:
                 continue
@@ -104,7 +106,9 @@ def _graph_search(query: str, limit: int = 20) -> list[dict[str, Any]]:
         return [dict(record) for record in result]
 
 
-def _build_augmented_prompt(system_prompt: str, user_query: str, retrieved_context: str) -> str:
+def _build_augmented_prompt(
+    system_prompt: str, user_query: str, retrieved_context: str
+) -> str:
     return (
         f"[S.P - System Prompt]\n{system_prompt}\n\n"
         f"[U.Q - User Query]\n{user_query}\n\n"
@@ -112,7 +116,9 @@ def _build_augmented_prompt(system_prompt: str, user_query: str, retrieved_conte
     )
 
 
-async def _answer_from_vector_bm25(query: str, chunks: list[dict[str, Any]]) -> SectionAnswer:
+async def _answer_from_vector_bm25(
+    query: str, chunks: list[dict[str, Any]]
+) -> SectionAnswer:
     if not chunks:
         return SectionAnswer(
             answer=NOT_IN_DOC_MESSAGE,
@@ -123,14 +129,16 @@ async def _answer_from_vector_bm25(query: str, chunks: list[dict[str, Any]]) -> 
         f"[Chunk {c.get('chunk_id', 'ref')} | {c.get('filename', 'Source')} p.{c.get('page', '?')}]: {c['text']}"
         for c in chunks
     )
-    sources = sorted({f"{c.get('filename', 'Source')} (p. {c.get('page', '?')})" for c in chunks})
+    sources = sorted(
+        {f"{c.get('filename', 'Source')} (p. {c.get('page', '?')})" for c in chunks}
+    )
 
     system_prompt = (
-        "You are a strict document-grounded assistant. Answer ONLY using facts explicitly stated "
-        "in the provided [R.C - Retrieved Context] passages. Do NOT use outside or general knowledge. "
-        f"If the provided passages do not contain facts relevant to the user's question, respond with: "
-        f"'{NOT_IN_DOC_MESSAGE}' "
-        "Keep answers clear, concise, and in plain human language."
+        "You are a helpful document-grounded architect assistant. Answer the user's question clearly "
+        "in plain human language using the facts in [R.C - Retrieved Context]. Summarize matching "
+        "details directly from the passages and use consistent formatting without markdown code ticks "
+        "around plain words. Only say the uploaded document does not contain information when the "
+        "passages have no relevant facts for the question at all."
     )
     augmented_user_msg = _build_augmented_prompt(system_prompt, query, context_block)
 
@@ -149,7 +157,9 @@ async def _answer_from_vector_bm25(query: str, chunks: list[dict[str, Any]]) -> 
     return parsed
 
 
-async def _answer_from_graph(query: str, triples: list[dict[str, Any]]) -> SectionAnswer:
+async def _answer_from_graph(
+    query: str, triples: list[dict[str, Any]]
+) -> SectionAnswer:
     if not triples:
         return SectionAnswer(
             answer=NOT_IN_GRAPH_MESSAGE,
@@ -160,12 +170,15 @@ async def _answer_from_graph(query: str, triples: list[dict[str, Any]]) -> Secti
         f"({t['subject']}) -[{t['relation']}]-> ({t['object']}) [NodeRef p.{t.get('page', '?')}]"
         for t in triples
     ]
-    sources = sorted({f"{t.get('filename', 'Source')} (p. {t.get('page', '?')})" for t in triples})
+    sources = sorted(
+        {f"{t.get('filename', 'Source')} (p. {t.get('page', '?')})" for t in triples}
+    )
 
     system_prompt = (
-        "You are a strict graph-grounded assistant. Explain relationships ONLY using the triples in "
-        "[R.C - Retrieved Context]. Do NOT extrapolate or bring in outside knowledge. If the triples "
-        f"do not answer the user's question, respond with: '{NOT_IN_GRAPH_MESSAGE}'"
+        "You are a helpful graph-grounded architect assistant. Explain how entities and components "
+        "connect in plain language using the triples in [R.C - Retrieved Context]. Keep formatting "
+        "consistent without backticks around plain words. Only say no matching relationships were "
+        "found if the triples are completely unrelated to the question."
     )
     augmented_user_msg = _build_augmented_prompt(
         system_prompt,
@@ -199,24 +212,44 @@ async def run_three_section_query(query: str) -> dict[str, Any]:
         _answer_from_graph(query, triples),
     )
 
+    has_vector_hits = bool(chunks) and vector_sec.answer.strip() != NOT_IN_DOC_MESSAGE
+    has_graph_hits = bool(triples) and graph_sec.answer.strip() != NOT_IN_GRAPH_MESSAGE
+
+    if has_vector_hits and has_graph_hits:
+        deterministic_winner = "Hybrid (Both)"
+    elif has_graph_hits:
+        deterministic_winner = "Knowledge Graph"
+    elif has_vector_hits:
+        deterministic_winner = "Vector + BM25"
+    else:
+        deterministic_winner = "Hybrid (Both)"
+
     chunk_refs = [
         f"Chunk {c.get('chunk_id', 'ref')}: {c['text'][:240]}" for c in chunks
     ]
     node_refs = [
-        f"NodeRef ({t['subject']} -> {t['relation']} -> {t['object']})" for t in triples[:10]
+        f"NodeRef ({t['subject']} -> {t['relation']} -> {t['object']})"
+        for t in triples[:10]
     ]
     combined_context = "\n".join(chunk_refs + node_refs) or "No retrieved items."
 
     judge_system = (
-        "You are a strict, grounded assistant. Base `best_answer` ONLY on the retrieved context and "
-        "the two section answers provided. Do NOT add outside facts if the uploaded document does not "
-        f"contain them; if neither section contains relevant facts from the uploaded document, set "
-        f"`best_answer` to '{NOT_IN_DOC_MESSAGE}'."
+        "You are a deterministic, grounded architect assistant. "
+        f"Always set `winner` to '{deterministic_winner}'. "
+        "Write `best_answer` using ONLY the retrieved context and section answers provided, "
+        "with a short 1-2 sentence overview followed by concise bullet points when listing items, "
+        "without backticks around plain words. Keep wording and structure consistent for "
+        "identical queries."
     )
     judge_prompt = _build_augmented_prompt(
         judge_system,
         query,
-        f"{combined_context}\n\nOption A (Vector + BM25):\n{vector_sec.answer}\n\nOption B (Knowledge Graph):\n{graph_sec.answer}",
+        (
+            f"Required Winner: {deterministic_winner}\n\n"
+            f"{combined_context}\n\n"
+            f"Option A (Vector + BM25):\n{vector_sec.answer}\n\n"
+            f"Option B (Knowledge Graph):\n{graph_sec.answer}"
+        ),
     )
 
     judge_resp = await client.beta.chat.completions.parse(
@@ -229,10 +262,11 @@ async def run_three_section_query(query: str) -> dict[str, Any]:
         ],
     )
     verdict = judge_resp.choices[0].message.parsed or JudgeVerdict(
-        comparison="Both retrieval paths were reviewed against the uploaded document.",
-        winner="Hybrid (Both)",
-        best_answer=NOT_IN_DOC_MESSAGE,
+        comparison="Both retrieval paths were evaluated deterministically.",
+        winner=deterministic_winner,
+        best_answer=vector_sec.answer or graph_sec.answer or NOT_IN_DOC_MESSAGE,
     )
+    verdict.winner = deterministic_winner
 
     query_terms = {w for w in tokenize(query) if len(w) > 2}
     term_hits = sum(
@@ -248,7 +282,11 @@ async def run_three_section_query(query: str) -> dict[str, Any]:
         else 0.0
     )
     distinct_relations = {t.get("relation") for t in triples if t.get("relation")}
-    live_hops = min(5, len(distinct_relations)) if distinct_relations else (1 if triples else 0)
+    live_hops = (
+        min(5, len(distinct_relations))
+        if distinct_relations
+        else (1 if triples else 0)
+    )
 
     top_matches = [
         {

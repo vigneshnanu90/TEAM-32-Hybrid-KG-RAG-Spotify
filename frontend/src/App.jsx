@@ -79,7 +79,9 @@ function uploadPdfWithProgress(file, onUpdate) {
       if (pollTimer) return;
       pollTimer = setInterval(async () => {
         try {
-          const res = await fetch(`/api/upload-status/${encodeURIComponent(jobId)}`);
+          const res = await fetch(
+            `/api/upload-status/${encodeURIComponent(jobId)}`
+          );
           if (!res.ok) return;
           const st = await res.json();
           if (typeof st.percent === "number") {
@@ -134,7 +136,9 @@ function uploadPdfWithProgress(file, onUpdate) {
         onUpdate({ percent: 100, stage: "Indexing complete" });
         resolve(data);
       } else {
-        reject(new Error(data.detail || data.message || `Upload failed (${xhr.status})`));
+        reject(
+          new Error(data.detail || data.message || `Upload failed (${xhr.status})`)
+        );
       }
     };
 
@@ -147,6 +151,17 @@ function uploadPdfWithProgress(file, onUpdate) {
     formData.append("file", file);
     xhr.send(formData);
   });
+}
+
+function getEmptyStateTitle(mode) {
+  const normalized = String(mode || "hybrid").toLowerCase();
+  if (normalized.includes("vector")) {
+    return "Vector + BM25 Retrieval";
+  }
+  if (normalized.includes("graph")) {
+    return "Neo4j GraphRAG Explorer";
+  }
+  return "Hybrid RAG — Vector, BM25 & Graph";
 }
 
 export default function App() {
@@ -210,7 +225,9 @@ export default function App() {
       });
       await refreshDocuments();
       setStatusMessage(
-        `Indexed "${summary.filename || file.name}" (${summary.chunks_indexed || 0} chunks, ${summary.triples_stored || 0} graph links).`
+        `Indexed "${summary.filename || file.name}" (${
+          summary.chunks_indexed || 0
+        } chunks, ${summary.triples_stored || 0} graph links).`
       );
     } catch (err) {
       setStatusMessage(err.message || "Unable to upload PDF.");
@@ -236,7 +253,9 @@ export default function App() {
         throw new Error(data.detail || `Delete failed (${res.status})`);
       }
       setDocuments((prev) => prev.filter((d) => d.doc_id !== docId));
-      setStatusMessage("Deleted PDF and removed its indexed vector, keyword, and graph data.");
+      setStatusMessage(
+        "Deleted PDF and removed its indexed vector, keyword, and graph data."
+      );
     } catch (err) {
       setStatusMessage(err.message || "Unable to delete PDF.");
     } finally {
@@ -255,6 +274,9 @@ export default function App() {
       return;
     }
 
+    const activeMode = retrievalMode;
+    const normalizedMode = String(activeMode || "hybrid").toLowerCase();
+
     setInputError("");
     setActiveView("chat");
     setIsSending(true);
@@ -266,7 +288,7 @@ export default function App() {
       {
         id: turnId,
         question: cleaned,
-        mode: retrievalMode,
+        mode: activeMode,
         answer: "",
         loading: true,
       },
@@ -281,13 +303,15 @@ export default function App() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           query: cleaned,
-          mode: retrievalMode,
+          mode: activeMode,
         }),
         signal: controller.signal,
       });
       const data = await res.json().catch(() => ({}));
       if (!res.ok) {
-        throw new Error(data.detail || data.message || `Request failed (${res.status})`);
+        throw new Error(
+          data.detail || data.message || `Request failed (${res.status})`
+        );
       }
 
       if (data.blocked) {
@@ -296,7 +320,9 @@ export default function App() {
             t.id === turnId
               ? {
                   ...t,
-                  answer: data.guardrail_reason || "Query was blocked by input guardrails.",
+                  answer:
+                    data.guardrail_reason ||
+                    "Query was blocked by input guardrails.",
                   error: true,
                   loading: false,
                 }
@@ -309,27 +335,47 @@ export default function App() {
       const summaryText = extractReadableText(
         data.comparison_section?.best_answer || data.answer || data.response
       );
-      const matchesText = extractReadableText(data.vector_section);
-      const graphText = extractReadableText(data.graph_section);
+      const vectorAnswer = extractReadableText(data.vector_section);
+      const graphAnswer = extractReadableText(data.graph_section);
+
+      const matchesText = normalizedMode.includes("graph") ? "" : vectorAnswer;
+      const graphText = normalizedMode.includes("vector") ? "" : graphAnswer;
+
+      const sourceList = normalizedMode.includes("vector")
+        ? Array.isArray(data?.vector_section?.sources)
+          ? data.vector_section.sources
+          : []
+        : normalizedMode.includes("graph")
+        ? Array.isArray(data?.graph_section?.sources)
+          ? data.graph_section.sources
+          : []
+        : [
+            ...(Array.isArray(data?.vector_section?.sources)
+              ? data.vector_section.sources
+              : []),
+            ...(Array.isArray(data?.graph_section?.sources)
+              ? data.graph_section.sources
+              : []),
+          ];
 
       const pageChips = Array.from(
         new Set(
-          [
-            ...(Array.isArray(data?.vector_section?.sources) ? data.vector_section.sources : []),
-            ...(Array.isArray(data?.graph_section?.sources) ? data.graph_section.sources : []),
-          ].map((s) => {
+          sourceList.map((s) => {
             const match = String(s).match(/p\.\s*([0-9]+)/i);
             return match ? `p.${match[1]}` : String(s);
           })
         )
       ).slice(0, 4);
 
-      const trace = buildTraceFromResponse(data, retrievalMode);
+      const trace = buildTraceFromResponse(data, activeMode);
 
-      const combinedAnswer =
-        summaryText ||
-        [matchesText, graphText].filter(Boolean).join("\n\n") ||
-        "No response content was returned for this query.";
+      const combinedAnswer = normalizedMode.includes("vector")
+        ? matchesText || "No vector/BM25 answer was returned for this query."
+        : normalizedMode.includes("graph")
+        ? graphText || "No graph answer was returned for this query."
+        : summaryText ||
+          [matchesText, graphText].filter(Boolean).join("\n\n") ||
+          "No response content was returned for this query.";
 
       setTurns((prev) =>
         prev.map((t) =>
@@ -337,11 +383,11 @@ export default function App() {
             ? {
                 ...t,
                 answer: combinedAnswer,
-                summaryText: summaryText || combinedAnswer,
+                summaryText: normalizedMode === "hybrid" ? summaryText || combinedAnswer : "",
                 matchesText,
                 graphText,
                 pageChips,
-                hops: trace.hops,
+                hops: normalizedMode.includes("vector") ? 0 : trace.hops,
                 trace,
                 loading: false,
               }
@@ -416,10 +462,11 @@ export default function App() {
               {turns.length === 0 ? (
                 <div className="my-auto space-y-2 py-8 text-center">
                   <h2 className="text-lg font-semibold text-white sm:text-xl">
-                    AI Architect Chat
+                    {getEmptyStateTitle(retrievalMode)}
                   </h2>
                   <p className="mx-auto max-w-md text-xs text-emerald-200/75 sm:text-sm">
-                    Upload a PDF in the sidebar or ask a question to inspect Summary, Matches, and Graph results.
+                    Upload a PDF in the sidebar or ask a question to inspect
+                    results for your selected retrieval mode.
                   </p>
                 </div>
               ) : (
@@ -492,7 +539,10 @@ export default function App() {
           )}
 
           {activeView === "architecture" && (
-            <ArchitectureExplorerView onAskPrompt={submitQuestion} />
+            <ArchitectureExplorerView
+              documents={documents}
+              onAskPrompt={submitQuestion}
+            />
           )}
 
           {activeView === "documents" && (

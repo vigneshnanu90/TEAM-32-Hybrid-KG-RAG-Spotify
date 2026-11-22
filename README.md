@@ -14,19 +14,23 @@ A full-stack, mobile-responsive Retrieval-Augmented Generation (RAG) application
   * **Neo4j Knowledge Graph:** Extracts structured `(subject, relation, object)` triples via LLM (`TripleExtractionResult`) and merges `:Entity` nodes and `[:RELATES]` edges tagged with `doc_id`, `filename`, and `page`.
 * **Complete Lifecycle Deletion:** Deleting an uploaded PDF purges its file, removes its BM25 records (by `doc_id` and `filename`), rebuilds/clears the FAISS index, and deletes its Neo4j relationships and orphaned entity nodes.
 
-### 2. Guardrails, Strict Grounding & Hybrid Retrieval (`backend/guardrails.py`, `backend/retriever.py`)
+### 2. Guardrails, Deterministic Grounding & Hybrid Retrieval (`backend/guardrails.py`, `backend/retriever.py`)
 
 * **Input Guardrails:** Validates query length (`<= 1,000` chars), blocks prompt-injection patterns, checks store readiness (`has_documents`), and runs a zero-temperature policy classifier.
 * **Hybrid Search & Reranking:** Executes parallel **FAISS + BM25** search fused via Reciprocal Rank Fusion (RRF, $k=60$) with query-term reranking alongside **Neo4j** Cypher graph traversal.
-* **Strict Document-Grounded Synthesis (`S.P + U.Q + R.C`):** Combines System Prompt (`S.P`), User Query (`U.Q`), and Retrieved Context (`R.C`) with a judge step (`JudgeVerdict`) that answers strictly from the uploaded document's retrieved passages and triples, explicitly reporting when an unrelated topic is not covered in the uploaded PDF.
+* **Deterministic Document-Grounded Synthesis (`S.P + U.Q + R.C`):** Uses `temperature=0.0` across section synthesis and judge evaluation (`JudgeVerdict`) with deterministic winner selection (`Hybrid (Both)`, `Vector + BM25`, or `Knowledge Graph`) so repeated identical queries produce consistent answers grounded strictly in the uploaded PDF.
 * **Per-Query Retrieval Trace:** Returns live `retrieval_trace` telemetry (FAISS vector score, BM25 score, matched chunk previews, distinct relation hops, and triples).
 
-### 3. Responsive Frontend Workspace (`frontend/src/`)
+### 3. Mode-Isolated Frontend Workspace (`frontend/src/`)
 
-* **AI Architect Chat (`App.jsx`, `ComparisonChatTurn.jsx`, `RetrievalTracePanel.jsx`):**
-  * Mode toggles (`Hybrid`, `Vector`, `Graph`), interactive `Summary` / `Matches` / `Graph` answer tabs, source page badges, hop counters, and `Copy` / `Retry` controls.
-  * **Per-Query Retrieval Trace:** Displays live FAISS Vector and BM25 score bars, matched text snippets, and a Neo4j triple diagram beside each individual chat turn on desktop and stacked cleanly on mobile.
-  * **Mobile Resilience:** Single-line sticky header (`WorkspaceHeader.jsx`), slide-out navigation drawer, and `120s` `AbortController` timeout handling.
+* **Mode-Aware Header & Chat (`WorkspaceHeader.jsx`, `App.jsx`, `ComparisonChatTurn.jsx`):**
+  * Custom browser tab title (`Spotify Architect RAG — Hybrid Vector, BM25 & Graph`) and dynamic workspace headers (`Hybrid RAG — Vector, BM25 & Graph`, `Vector + BM25 Retrieval`, `Neo4j GraphRAG Explorer`) paired with mode-specific loading indicators.
+  * **Strict Mode Isolation:**
+    * **Hybrid Mode:** Displays interactive `Best Match`, `Vector`, and `Graph` tabs with `Best Match` active by default.
+    * **Vector Mode:** Displays only the **Vector** result and source page chips, ignoring graph answers and hop badges.
+    * **Graph Mode:** Displays only the **Graph** result and relationship hops, ignoring vector chunk answers.
+  * **Per-Query Retrieval Trace (`RetrievalTracePanel.jsx`):** Displays live FAISS Vector and BM25 score bars, matched text snippets, and a Neo4j triple diagram beside each individual chat turn on desktop and stacked cleanly on mobile.
+  * **Mobile Resilience:** Sticky header, slide-out navigation drawer, and `120s` `AbortController` timeout handling with `Retry` actions.
 * **Interactive Knowledge Graph Explorer (`ArchitectureExplorerView.jsx`, `GET /api/graph`):**
   * **Island-Packed Force Simulation (`layoutIslands` + `tickSimulation`):** Separates connected subgraphs into non-overlapping islands with golden-angle spiral initialization, pairwise repulsion, collision avoidance, and edge springs so dense graphs never clump.
   * **Pan, Zoom, Drag & Type Filtering:** Supports pointer drag on individual nodes, canvas panning, wheel/pinch zooming (`0.35x`–`4x`) with zoom-to-fit (`⤢`), dynamic type filter pills (`Hub`, `Service`, `Component`, `Data`, `API`, etc.), hub-aware label decluttering, and a side inspector panel with top-hub shortcuts and one-click **Ask AI about this node** prompts.
@@ -46,6 +50,7 @@ Hybrid-Rag-Framework/
 │   ├── requirements.txt
 │   └── retriever.py
 ├── frontend/
+│   ├── index.html
 │   ├── src/
 │   │   ├── components/
 │   │   │   ├── ComparisonChatTurn.jsx

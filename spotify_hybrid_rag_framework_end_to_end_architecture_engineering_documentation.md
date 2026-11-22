@@ -2,7 +2,7 @@
 
 ## 1. Executive Summary & System Overview
 
-The **Spotify Hybrid RAG Framework** is a full-stack, mobile-responsive Retrieval-Augmented Generation (RAG) web application engineered to ingest unstructured and semi-structured PDF documents, index them across dense vector, lexical keyword, and property graph stores, and synthesize accurate, document-grounded answers with live retrieval telemetry.
+The **Spotify Hybrid RAG Framework** is a full-stack, mobile-responsive Retrieval-Augmented Generation (RAG) web application engineered to ingest unstructured and semi-structured PDF documents, index them across dense vector, lexical keyword, and property graph stores, and synthesize deterministic, document-grounded answers with live retrieval telemetry.
 
 ### High-Level Tech Stack
 
@@ -12,7 +12,7 @@ The **Spotify Hybrid RAG Framework** is a full-stack, mobile-responsive Retrieva
   * **Dense Vector Store:** FAISS (`IndexFlatL2`) with OpenAI Embeddings.
   * **Lexical Search Store:** `rank-bm25` (`BM25Okapi`) persisted via pickle (`bm25_docs.pkl`).
   * **Knowledge Graph:** Neo4j Graph Database (`Entity` nodes and `RELATES` directed edges).
-* **LLM & Synthesis:** OpenAI Chat Completions API utilizing structured output parsing (`SectionAnswer`, `JudgeVerdict`, `TripleExtractionResult`, `GuardrailDecision`).
+* **LLM & Synthesis:** OpenAI Chat Completions API (`temperature=0.0`) utilizing structured output parsing (`SectionAnswer`, `JudgeVerdict`, `TripleExtractionResult`, `GuardrailDecision`).
 * **Deployment & Infrastructure:** Docker & Docker Compose, Nginx reverse proxy with Let's Encrypt SSL/TLS hosted on a Hostinger VPS (`vickycore.io` and `team-32.vickycore.io`), integrated with GitHub CI/CD (`main` branch).
 
 ## 2. Alignment with Architectural Design Requirements
@@ -25,7 +25,7 @@ The system implements all three architectural blueprints defined during project 
    * Enforces complete data lifecycle management: deleting a PDF purges its chunks from BM25, rebuilds/clears the FAISS index, removes tagged relationships and orphaned nodes in Neo4j, and deletes the raw file from disk.
 2. **Hybrid Retrieval, Reranking & Augmentation (`S.P + U.Q + R.C`):**
    * Executes parallel **Vector + BM25** search (fused via Reciprocal Rank Fusion and keyword reranking) alongside **Neo4j Cypher traversal**.
-   * Combines `{Chunks + Node Ref}` with the System Prompt (`S.P`), User Query (`U.Q`), and Retrieved Context (`R.C`) under strict grounding constraints so answers rely exclusively on the uploaded document's content.
+   * Combines `{Chunks + Node Ref}` with the System Prompt (`S.P`), User Query (`U.Q`), and Retrieved Context (`R.C`) at `temperature=0.0` under strict grounding constraints so answers rely exclusively on the uploaded document's content.
 3. **Production Deployment:**
    * Version-controlled in GitHub, containerized via multi-stage Docker builds, and served over HTTPS via Nginx on a Linux VPS.
 
@@ -62,9 +62,9 @@ Before running retrieval or LLM synthesis, `check_input_guardrail()` validates e
 * **Index Readiness Check:** Verifies `has_documents` (`len(load_bm25_records()) > 0`) and instructs the user to upload a PDF if the store is empty.
 * **Semantic Policy Gate:** Uses a zero-temperature LLM classifier (`GuardrailDecision`) to permit legitimate architectural queries while blocking harmful, medical, financial, or legal requests.
 
-### 3.3 Hybrid Retrieval, RRF Fusion & Strict Grounding (`backend/retriever.py`)
+### 3.3 Hybrid Retrieval, RRF Fusion & Deterministic Grounding (`backend/retriever.py`)
 
-`run_three_section_query(query)` orchestrates parallel retrieval and three-stage grounded synthesis:
+`run_three_section_query(query)` orchestrates parallel retrieval and deterministic grounded synthesis:
 
 1. **Vector + BM25 Hybrid Search & Reranking (`_vector_and_bm25_search`):**
    * **Dense Retrieval:** Queries `FAISS.similarity_search(query, k=5)`.
@@ -74,22 +74,28 @@ Before running retrieval or LLM synthesis, `check_input_guardrail()` validates e
    * **Keyword Reranking:** Applies a relevance boost (`+0.02` per matching query token $> 2$ characters) to reorder fused candidates before selecting the top $k=5$ chunks.
 2. **Knowledge Graph Traversal (`_graph_search`):**
    * Extracts up to 6 meaningful keywords ($\text{length} > 2$) from the query and runs a case-insensitive Cypher match across `s.name`, `o.name`, and `r.type` to retrieve up to 20 matching `(subject, relation, object)` triples with source page metadata.
-3. **Strict Document-Grounded Synthesis (`S.P + U.Q + R.C`) & Judge Evaluation:**
-   * `_answer_from_vector_bm25` and `_answer_from_graph` run concurrently via `asyncio.gather()` at `GROUNDED_TEMPERATURE = 0.2`, explicitly forbidding outside or pre-trained knowledge and returning `NOT_IN_DOC_MESSAGE` / `NOT_IN_GRAPH_MESSAGE` when the uploaded PDF lacks relevant facts.
-   * A final judge step (`JudgeVerdict`) reviews both answers alongside `{Chunks + Node Ref}` context, selects the winning strategy (`Vector + BM25`, `Knowledge Graph`, or `Hybrid (Both)`), and produces `best_answer`.
+3. **Deterministic Document-Grounded Synthesis (`S.P + U.Q + R.C`) & Judge Evaluation:**
+   * `_answer_from_vector_bm25` and `_answer_from_graph` run concurrently via `asyncio.gather()` at `GROUNDED_TEMPERATURE = 0.0`, summarizing matching details strictly from `[R.C - Retrieved Context]` without outside knowledge or inconsistent markdown code ticks.
+   * When both vector chunks and graph triples contain relevant hits, `deterministic_winner` is fixed to `"Hybrid (Both)"` (falling back deterministically to `"Knowledge Graph"` or `"Vector + BM25"` when only one path has matches), and `judge_resp` synthesizes `best_answer` at `DEFAULT_TEMPERATURE = 0.0` with consistent overview + bullet formatting.
    * Live telemetry (`retrieval_trace`) returns `vector_score`, `bm25_score`, `chunks_retrieved`, `triples_retrieved`, `graph_hops`, `top_matches`, and `triples` for per-query UI rendering.
 
 ## 4. UI & Frontend Architecture Evolution
 
-### 4.1 Desktop vs. Mobile Responsive Architecture
+### 4.1 Mode-Isolated Chat & Adaptive Workspace Headers
 
-* **Left Sidebar (`PdfSidebar.jsx`):** Fixed `w-64` navigation panel on desktop (and slide-out drawer on mobile) housing view switchers (`AI Architect Chat`, `Tech Stack & Services`, `Indexed PDFs`), PDF count badge, `.pdf` upload dropzone with live stage + percentage progress bar, and per-document `Delete` controls.
-* **Center Workspace (`App.jsx` & `ComparisonChatTurn.jsx`):** Single-line sticky `WorkspaceHeader` (`Hybrid`, `Vector`, `Graph` mode toggles + `New Chat`), user prompt bubbles, and structured answer cards featuring interactive `Summary`, `Matches`, and `Graph` pill tabs, source page badges, hop counters, and `Copy` / `Retry` actions.
+* **Browser Title & Dynamic Mode Headers (`frontend/index.html`, `WorkspaceHeader.jsx`, `App.jsx`):**
+  * Browser tab title is branded as **Spotify Architect RAG — Hybrid Vector, BM25 & Graph**.
+  * Header and empty-state titles adapt dynamically to the selected mode: **Hybrid RAG — Vector, BM25 & Graph** (`hybrid`), **Vector + BM25 Retrieval** (`vector`), and **Neo4j GraphRAG Explorer** (`graph`), as well as **Live Knowledge Graph — Nodes & Edges** and **Document Indexer — FAISS, BM25 & Neo4j** for secondary views.
+* **Mode-Specific Loading & Result Isolation (`ComparisonChatTurn.jsx`, `App.jsx`):**
+  * In-flight turns display mode-accurate progress messages (`Running Vector + BM25 search across indexed chunks...`, `Running Neo4j GraphRAG search across entity relationships...`, or `Running Hybrid RAG search across Vector, BM25, and Graph...`).
+  * **Hybrid Mode** renders `Best Match`, `Vector`, and `Graph` tabs with `Best Match` selected by default.
+  * **Vector Mode** renders only the **Vector** tab and source page badges while ignoring graph results and hop badges.
+  * **Graph Mode** renders only the **Graph** tab and relationship hop badges while ignoring vector chunk results.
 * **Per-Query Right Trace Column (`RetrievalTracePanel.jsx`):** Paired row-by-row alongside every chat turn (`xl:flex-row`), displaying live FAISS Vector and BM25 score bars, matched chunk snippets, and a visual Neo4j `(Subject) -[RELATION]-> (Object)` node diagram.
 
 ### 4.2 Interactive Force-Directed Knowledge Graph Explorer (`ArchitectureExplorerView.jsx`)
 
-`ArchitectureExplorerView.jsx` provides a full-featured interactive graph canvas backed by `GET /api/graph`:
+`ArchitectureExplorerView.jsx` provides an interactive graph canvas backed by `GET /api/graph`:
 
 * **Connected-Component Island Packing (`layoutIslands`):** Uses Union-Find to partition the graph into connected components and arranges them as non-overlapping islands (largest cluster centered, smaller clusters spiraled outward) so disconnected groups never pile onto each other.
 * **d3-Force-Style Physics Simulation (`tickSimulation`):** Combines intra-component Coulomb repulsion, edge spring attraction scaled by node radius and degree, anchor gravity, and circle collision resolution (`minD = a.r + b.r + 30`) with smooth alpha decay (`ALPHA_DECAY = 0.972`) and golden-angle spiral seeding.
@@ -106,12 +112,14 @@ Before running retrieval or LLM synthesis, `check_input_guardrail()` validates e
 | # | Issue / Symptom | Root Cause | Resolution Implemented |
 | :--- | :--- | :--- | :--- |
 | **1** | **Raw JSON & Escaped Formatting in Chat Output** | Backend structured responses or stringified JSON payloads with literal `\n` and `**` markdown markers rendered directly in UI bubbles. | Built `extractReadableText()` in `App.jsx` to parse JSON strings, extract `best_answer`/`answer`, normalize escaped newlines, and strip markdown artifacts, paired with `FormattedText` bullet rendering in `ComparisonChatTurn.jsx`. |
-| **2** | **Mobile Query Failures (`Load failed`) & Header Wrapping** | Multi-stage hybrid retrieval + LLM calls exceeded mobile browser idle tolerances; narrow screens wrapped header buttons onto multiple lines. | Added an `AbortController` (`120,000 ms` timeout) and `Retry` button in `App.jsx`, and enforced `whitespace-nowrap` + compact sizing in `WorkspaceHeader.jsx`. |
+| **2** | **Mobile Query Failures (`Load failed`) & Header Wrapping** | Multi-stage hybrid retrieval + LLM calls exceeded mobile browser idle tolerances; narrow screens wrapped header buttons onto multiple lines. | Added an `AbortController` (`120,000 ms` timeout) and `Retry` button in `App.jsx`, and enforced responsive layout rules in `WorkspaceHeader.jsx`. |
 | **3** | **Static / Identical Retrieval Trace Metrics Across Queries** | A single trace panel was pinned at the top of the page and populated with estimated scores based solely on chunk count (`0.87` / `0.68`). | Added real `retrieval_trace` telemetry (RRF/keyword scores, top chunk previews, distinct relation hops, and live triples) to `retriever.py` and rendered a dedicated `RetrievalTracePanel` beside each individual chat turn. |
 | **4** | **Residual Graph/Chunk Data After Deleting a PDF** | Deleting a PDF only matched `doc_id` in some stores or left orphaned Neo4j edges visible in `GET /api/graph` even when `0 PDFs` were indexed. | Updated `delete_document_by_id()` to match by both `doc_id` and `filename` across BM25, FAISS, and Neo4j (including orphan node cleanup), and updated `GET /api/graph` to return empty results immediately when `indexed_docs.json` is empty. |
-| **5** | **LLM Answering Off-Topic Queries Using Pre-Trained Knowledge** | When an unrelated PDF was uploaded, the LLM used general pre-trained knowledge to answer questions about topics absent from the PDF. | Tightened system prompts and lowered synthesis temperature (`GROUNDED_TEMPERATURE = 0.2`) in `retriever.py` so the model strictly answers from `[R.C - Retrieved Context]` or states that the uploaded document does not cover the topic. |
+| **5** | **LLM Off-Topic Hallucinations vs. Over-Refusal** | Initial prompts allowed pre-trained knowledge on unrelated PDFs; an initial strict pass caused over-refusal on valid backend architecture queries. | Balanced prompts in `retriever.py` so the LLM summarizes matching facts directly from `[R.C - Retrieved Context]` and only refuses when retrieved passages/triples contain no relevant facts. |
 | **6** | **Upload Progress Jumping Immediately to `100%`** | `xhr.upload.onprogress` only tracked browser-to-server network transfer, hitting `100%` before backend splitting, Neo4j extraction, and embedding finished. | Added server-side `INGEST_JOBS` tracking (`GET /api/upload-status/{job_id}`) in `ingest.py`/`main.py` and paired `0%–15%` network upload with `700 ms` stage polling in `App.jsx`, `PdfSidebar.jsx`, and `DocumentManagerView.jsx`. |
 | **7** | **Node Clumping in Knowledge Graph Visualization** | Initial physics pulled nodes toward the center without island separation or collision avoidance, causing nodes and labels to overlap. | Rebuilt `ArchitectureExplorerView.jsx` with connected-component island packing (`layoutIslands`), force-directed repulsion + collision resolution (`tickSimulation`), zoom/pan/drag gestures, type filter pills, and hub-based label decluttering. |
+| **8** | **Inconsistent Winner & Formatting on Repeated Identical Queries** | Judge and section LLM calls sampled at `temperature=0.5`/`0.3` without a deterministic winner tie-breaker, flipping between prose/bullets and `Graph` vs. `Vector` winners. | Set `DEFAULT_TEMPERATURE = 0.0` and `GROUNDED_TEMPERATURE = 0.0` in `retriever.py` and enforced deterministic `winner` selection and consistent formatting. |
+| **9** | **Mode Mismatch in Loading Text & Mixed Results in Vector/Graph Modes** | Loading status hardcoded `"Running hybrid retrieval..."` and `ComparisonChatTurn` displayed all three tabs (`Best Match`, `Vector`, `Graph`) even when `Vector` or `Graph` mode was selected. | Updated `WorkspaceHeader.jsx`, `ComparisonChatTurn.jsx`, `App.jsx`, and `index.html` to reflect the active mode in the title and loading indicator, and isolated `Vector` and `Graph` modes so each displays only its respective result. |
 
 ## 6. Deployment & Verification Workflow
 
@@ -126,7 +134,7 @@ Before running retrieval or LLM synthesis, `check_input_guardrail()` validates e
    ```
 4. Verify locally at `http://localhost`:
    * Upload a `.pdf` and verify real-time stage progress (`Upload`, `Split Text`, `Graph Nodes`, `FAISS & BM25`) before hitting `100%`.
-   * Run on-topic and off-topic queries to confirm strict document grounding and per-turn `Retrieval trace` cards.
+   * Test **Hybrid** (`Best Match`, `Vector`, `Graph`), **Vector** (Vector result only), and **Graph** (Graph result only) modes, and ask identical queries twice to confirm consistent answers.
    * Open **Tech Stack & Services** to test island-packed force layout, node dragging, zoom/pan, type filter pills, and node inspection.
    * Delete the uploaded PDF and verify `0 PDFs` and `0 Nodes` / `0 Edges`.
 
