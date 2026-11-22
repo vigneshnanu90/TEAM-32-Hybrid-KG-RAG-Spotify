@@ -100,7 +100,7 @@ export default function PdfSidebar({
           <input
             ref={fileInputRef}
             type="file"
-            accept=".pdf,application/pdf"
+            accept=".pdf,.md,.json,.xml,.txt,.csv"
             onChange={handleFileChange}
             disabled={isUploading}
             className="hidden"
