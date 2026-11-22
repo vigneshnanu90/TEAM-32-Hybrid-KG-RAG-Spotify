@@ -70,19 +70,60 @@ function buildTraceFromResponse(data, mode) {
   };
 }
 
-function uploadPdfWithProgress(file, onProgress) {
+function uploadPdfWithProgress(file, onUpdate) {
   return new Promise((resolve, reject) => {
-    const xhr = new XMLHttpRequest();
-    xhr.open("POST", "/api/upload-pdf");
+    const jobId = `job_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+    let pollTimer = null;
 
-    xhr.upload.onprogress = (event) => {
-      if (event.lengthComputable && typeof onProgress === "function") {
-        const pct = Math.min(100, Math.round((event.loaded / event.total) * 100));
-        onProgress(pct);
+    const startPolling = () => {
+      if (pollTimer) return;
+      pollTimer = setInterval(async () => {
+        try {
+          const res = await fetch(`/api/upload-status/${encodeURIComponent(jobId)}`);
+          if (!res.ok) return;
+          const st = await res.json();
+          if (typeof st.percent === "number") {
+            onUpdate({
+              percent: Math.min(99, st.percent),
+              stage: st.stage || "Processing document...",
+            });
+          }
+        } catch {
+          // Ignore transient polling errors
+        }
+      }, 700);
+    };
+
+    const stopPolling = () => {
+      if (pollTimer) {
+        clearInterval(pollTimer);
+        pollTimer = null;
       }
     };
 
+    const xhr = new XMLHttpRequest();
+    xhr.open("POST", `/api/upload-pdf?job_id=${encodeURIComponent(jobId)}`);
+
+    xhr.upload.onprogress = (event) => {
+      if (event.lengthComputable) {
+        const netPct = Math.max(
+          1,
+          Math.min(15, Math.round((event.loaded / event.total) * 15))
+        );
+        onUpdate({ percent: netPct, stage: "Uploading PDF..." });
+        if (event.loaded >= event.total) {
+          startPolling();
+        }
+      }
+    };
+
+    xhr.upload.onload = () => {
+      onUpdate({ percent: 16, stage: "Extracting text from PDF pages..." });
+      startPolling();
+    };
+
     xhr.onload = () => {
+      stopPolling();
       let data = {};
       try {
         data = JSON.parse(xhr.responseText || "{}");
@@ -90,14 +131,17 @@ function uploadPdfWithProgress(file, onProgress) {
         data = {};
       }
       if (xhr.status >= 200 && xhr.status < 300) {
-        if (typeof onProgress === "function") onProgress(100);
+        onUpdate({ percent: 100, stage: "Indexing complete" });
         resolve(data);
       } else {
         reject(new Error(data.detail || data.message || `Upload failed (${xhr.status})`));
       }
     };
 
-    xhr.onerror = () => reject(new Error("Network error while uploading PDF."));
+    xhr.onerror = () => {
+      stopPolling();
+      reject(new Error("Network error while uploading PDF."));
+    };
 
     const formData = new FormData();
     formData.append("file", file);
@@ -113,6 +157,7 @@ export default function App() {
   const [documents, setDocuments] = useState([]);
   const [isUploading, setIsUploading] = useState(false);
   const [uploadProgress, setUploadProgress] = useState(0);
+  const [uploadStage, setUploadStage] = useState("");
   const [deletingDocId, setDeletingDocId] = useState(null);
   const [statusMessage, setStatusMessage] = useState("");
 
@@ -155,11 +200,13 @@ export default function App() {
 
   const handleUploadPdf = async (file) => {
     setIsUploading(true);
-    setUploadProgress(0);
+    setUploadProgress(1);
+    setUploadStage("Uploading PDF...");
     setStatusMessage("");
     try {
-      const summary = await uploadPdfWithProgress(file, (pct) => {
-        setUploadProgress(pct);
+      const summary = await uploadPdfWithProgress(file, ({ percent, stage }) => {
+        setUploadProgress(percent);
+        setUploadStage(stage);
       });
       await refreshDocuments();
       setStatusMessage(
@@ -169,7 +216,10 @@ export default function App() {
       setStatusMessage(err.message || "Unable to upload PDF.");
     } finally {
       setIsUploading(false);
-      setTimeout(() => setUploadProgress(0), 600);
+      setTimeout(() => {
+        setUploadProgress(0);
+        setUploadStage("");
+      }, 900);
     }
   };
 
@@ -343,6 +393,7 @@ export default function App() {
         documents={documents}
         isUploading={isUploading}
         uploadProgress={uploadProgress}
+        uploadStage={uploadStage}
         deletingDocId={deletingDocId}
         onUploadPdf={handleUploadPdf}
         onDeleteDocument={handleDeleteDocument}
@@ -449,6 +500,7 @@ export default function App() {
               documents={documents}
               isUploading={isUploading}
               uploadProgress={uploadProgress}
+              uploadStage={uploadStage}
               deletingDocId={deletingDocId}
               statusMessage={statusMessage}
               onUploadPdf={handleUploadPdf}

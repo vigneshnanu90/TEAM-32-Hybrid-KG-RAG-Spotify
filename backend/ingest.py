@@ -37,6 +37,26 @@ BM25_STORE_PATH: Path = STORAGE_ROOT / "bm25_docs.pkl"
 DOCS_META_PATH: Path = STORAGE_ROOT / "indexed_docs.json"
 FAISS_DIR: Path = STORAGE_ROOT / "faiss_index"
 
+INGEST_JOBS: dict[str, dict[str, Any]] = {}
+
+
+def update_ingest_job(
+    job_id: str | None,
+    percent: int,
+    stage: str,
+    done: bool = False,
+    error: str | None = None,
+) -> None:
+    if not job_id:
+        return
+    INGEST_JOBS[job_id] = {
+        "job_id": job_id,
+        "percent": max(0, min(100, int(percent))),
+        "stage": stage,
+        "done": done,
+        "error": error,
+    }
+
 
 class TripleItem(BaseModel):
     subject: str = Field(..., min_length=1)
@@ -184,21 +204,37 @@ def write_triples_to_neo4j(
         return int(record["inserted"]) if record else 0
 
 
-async def ingest_pdf(pdf_path: Path, original_filename: str) -> dict[str, Any]:
+async def ingest_pdf(
+    pdf_path: Path,
+    original_filename: str,
+    job_id: str | None = None,
+) -> dict[str, Any]:
     ensure_storage_dirs()
     doc_id = str(uuid.uuid4())[:8]
+    update_ingest_job(job_id, 18, "Extracting text from PDF pages...")
+
     pages = extract_pdf_pages(pdf_path)
     if not pages:
         if pdf_path.exists():
             pdf_path.unlink(missing_ok=True)
+        update_ingest_job(
+            job_id,
+            100,
+            "Failed",
+            done=True,
+            error="No extractable text found in the uploaded PDF.",
+        )
         raise ValueError("No extractable text found in the uploaded PDF.")
+
+    update_ingest_job(job_id, 26, f"Text splitting in progress ({len(pages)} pages)...")
 
     chunk_docs: list[Document] = []
     bm25_new_records: list[dict[str, Any]] = []
     total_triples = 0
     neo4j_error: str | None = None
+    total_pages = len(pages)
 
-    for page_num, page_text in pages:
+    for idx, (page_num, page_text) in enumerate(pages, start=1):
         chunks = splitter.split_text(page_text)
         for chunk_idx, chunk in enumerate(chunks):
             chunk_id = f"{doc_id}_p{page_num}_c{chunk_idx}"
@@ -219,6 +255,13 @@ async def ingest_pdf(pdf_path: Path, original_filename: str) -> dict[str, Any]:
                 }
             )
 
+        graph_pct = 30 + int((idx / max(1, total_pages)) * 40)
+        update_ingest_job(
+            job_id,
+            graph_pct,
+            f"Extracting Knowledge Graph nodes ({idx}/{total_pages} pages)...",
+        )
+
         if neo4j_error is None:
             try:
                 triples = await extract_triples_from_chunk(page_text)
@@ -228,6 +271,11 @@ async def ingest_pdf(pdf_path: Path, original_filename: str) -> dict[str, Any]:
             except Exception as exc:
                 neo4j_error = str(exc)
 
+    update_ingest_job(
+        job_id,
+        75,
+        f"Generating FAISS embeddings ({len(chunk_docs)} chunks)...",
+    )
     existing_faiss = load_faiss_store()
     if existing_faiss is None:
         vector_store = await FAISS.afrom_documents(chunk_docs, embeddings)
@@ -237,6 +285,7 @@ async def ingest_pdf(pdf_path: Path, original_filename: str) -> dict[str, Any]:
     FAISS_DIR.mkdir(parents=True, exist_ok=True)
     vector_store.save_local(str(FAISS_DIR))
 
+    update_ingest_job(job_id, 92, "Building BM25 lexical index...")
     all_bm25 = load_bm25_records()
     all_bm25.extend(bm25_new_records)
     save_bm25_records(all_bm25)
@@ -253,6 +302,7 @@ async def ingest_pdf(pdf_path: Path, original_filename: str) -> dict[str, Any]:
     docs_meta.append(doc_record)
     save_indexed_docs_meta(docs_meta)
 
+    update_ingest_job(job_id, 100, "Indexing complete", done=True)
     return {
         "doc_id": doc_id,
         "filename": original_filename,

@@ -9,6 +9,7 @@ from pydantic import BaseModel, Field
 from config import settings
 from guardrails import check_input_guardrail
 from ingest import (
+    INGEST_JOBS,
     UPLOADS_DIR,
     delete_document_by_id,
     ensure_storage_dirs,
@@ -16,6 +17,7 @@ from ingest import (
     load_bm25_records,
     load_indexed_docs_meta,
     neo4j_driver,
+    update_ingest_job,
 )
 from retriever import run_three_section_query
 
@@ -59,7 +61,23 @@ def list_documents() -> dict[str, list[dict[str, Any]]]:
     }
 
 
-async def _handle_pdf_upload(file: UploadFile) -> dict[str, Any]:
+@app.get("/api/upload-status/{job_id}")
+def get_upload_status(job_id: str) -> dict[str, Any]:
+    return INGEST_JOBS.get(
+        job_id,
+        {
+            "job_id": job_id,
+            "percent": 15,
+            "stage": "Preparing document...",
+            "done": False,
+        },
+    )
+
+
+async def _handle_pdf_upload(
+    file: UploadFile,
+    job_id: str | None = None,
+) -> dict[str, Any]:
     if not file.filename or not file.filename.lower().endswith(".pdf"):
         raise HTTPException(status_code=400, detail="Only .pdf files are supported.")
 
@@ -78,21 +96,30 @@ async def _handle_pdf_upload(file: UploadFile) -> dict[str, Any]:
     target_path.write_bytes(content)
 
     try:
-        summary = await ingest_pdf(target_path, safe_name)
+        summary = await ingest_pdf(target_path, safe_name, job_id=job_id)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except Exception as exc:
+        update_ingest_job(job_id, 100, "Failed", done=True, error=str(exc))
+        raise
 
     return {"status": "indexed", **summary}
 
 
 @app.post("/api/upload-pdf")
-async def upload_pdf(file: UploadFile = File(...)) -> dict[str, Any]:
-    return await _handle_pdf_upload(file)
+async def upload_pdf(
+    file: UploadFile = File(...),
+    job_id: str | None = None,
+) -> dict[str, Any]:
+    return await _handle_pdf_upload(file, job_id=job_id)
 
 
 @app.post("/api/upload")
-async def upload_pdf_alias(file: UploadFile = File(...)) -> dict[str, Any]:
-    return await _handle_pdf_upload(file)
+async def upload_pdf_alias(
+    file: UploadFile = File(...),
+    job_id: str | None = None,
+) -> dict[str, Any]:
+    return await _handle_pdf_upload(file, job_id=job_id)
 
 
 @app.delete("/api/documents/{doc_id}")
@@ -104,39 +131,51 @@ async def delete_document(doc_id: str) -> dict[str, Any]:
 
 
 @app.get("/api/graph")
-def get_live_graph(q: str = "", limit: int = 40) -> dict[str, Any]:
+def get_live_graph(q: str = "", limit: int = 50) -> dict[str, Any]:
+    indexed_docs = load_indexed_docs_meta()
+    if not indexed_docs:
+        return {
+            "nodes": [],
+            "edges": [],
+            "triple_count": 0,
+        }
+
+    active_doc_ids = [d["doc_id"] for d in indexed_docs if d.get("doc_id")]
+    active_filenames = [d["filename"] for d in indexed_docs if d.get("filename")]
+
     safe_limit = max(1, min(int(limit), 100))
     cleaned_q = (q or "").strip().lower()
 
-    params: dict[str, Any] = {"limit": safe_limit}
+    params: dict[str, Any] = {
+        "doc_ids": active_doc_ids,
+        "filenames": active_filenames,
+        "limit": safe_limit,
+    }
+
+    search_clause = ""
     if cleaned_q:
-        cypher = """
-        MATCH (s:Entity)-[r:RELATES]->(o:Entity)
-        WHERE toLower(s.name) CONTAINS $q
-           OR toLower(o.name) CONTAINS $q
-           OR toLower(r.type) CONTAINS $q
-        RETURN s.name AS subject,
-               coalesce(s.type, 'Entity') AS subject_type,
-               r.type AS relation,
-               o.name AS object,
-               coalesce(o.type, 'Entity') AS object_type,
-               r.filename AS filename,
-               r.page AS page
-        LIMIT $limit
+        search_clause = """
+        AND (
+          toLower(s.name) CONTAINS $q
+          OR toLower(o.name) CONTAINS $q
+          OR toLower(r.type) CONTAINS $q
+        )
         """
         params["q"] = cleaned_q
-    else:
-        cypher = """
-        MATCH (s:Entity)-[r:RELATES]->(o:Entity)
-        RETURN s.name AS subject,
-               coalesce(s.type, 'Entity') AS subject_type,
-               r.type AS relation,
-               o.name AS object,
-               coalesce(o.type, 'Entity') AS object_type,
-               r.filename AS filename,
-               r.page AS page
-        LIMIT $limit
-        """
+
+    cypher = f"""
+    MATCH (s:Entity)-[r:RELATES]->(o:Entity)
+    WHERE (r.doc_id IN $doc_ids OR r.filename IN $filenames)
+    {search_clause}
+    RETURN s.name AS subject,
+           coalesce(s.type, 'Entity') AS subject_type,
+           r.type AS relation,
+           o.name AS object,
+           coalesce(o.type, 'Entity') AS object_type,
+           r.filename AS filename,
+           r.page AS page
+    LIMIT $limit
+    """
 
     with neo4j_driver.session(database=settings.neo4j_database) as session:
         records = [dict(rec) for rec in session.run(cypher, **params)]

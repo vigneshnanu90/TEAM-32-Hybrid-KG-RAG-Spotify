@@ -15,6 +15,14 @@ from ingest import (
 
 client = AsyncOpenAI(api_key=settings.openai_api_key)
 DEFAULT_TEMPERATURE = 0.5
+GROUNDED_TEMPERATURE = 0.2
+
+NOT_IN_DOC_MESSAGE = (
+    "The uploaded document does not contain information relevant to this question."
+)
+NOT_IN_GRAPH_MESSAGE = (
+    "No matching relationships were found in the uploaded document's knowledge graph."
+)
 
 
 class SectionAnswer(BaseModel):
@@ -107,7 +115,7 @@ def _build_augmented_prompt(system_prompt: str, user_query: str, retrieved_conte
 async def _answer_from_vector_bm25(query: str, chunks: list[dict[str, Any]]) -> SectionAnswer:
     if not chunks:
         return SectionAnswer(
-            answer="I could not find matching text passages for this question yet.",
+            answer=NOT_IN_DOC_MESSAGE,
             sources=[],
         )
 
@@ -118,15 +126,17 @@ async def _answer_from_vector_bm25(query: str, chunks: list[dict[str, Any]]) -> 
     sources = sorted({f"{c.get('filename', 'Source')} (p. {c.get('page', '?')})" for c in chunks})
 
     system_prompt = (
-        "You are a helpful software architect assistant. Explain answers clearly in plain, "
-        "everyday human language using only the provided text passages. Use short paragraphs or "
-        "simple bullet points when helpful, and avoid raw JSON or robotic phrasing."
+        "You are a strict document-grounded assistant. Answer ONLY using facts explicitly stated "
+        "in the provided [R.C - Retrieved Context] passages. Do NOT use outside or general knowledge. "
+        f"If the provided passages do not contain facts relevant to the user's question, respond with: "
+        f"'{NOT_IN_DOC_MESSAGE}' "
+        "Keep answers clear, concise, and in plain human language."
     )
     augmented_user_msg = _build_augmented_prompt(system_prompt, query, context_block)
 
     resp = await client.beta.chat.completions.parse(
         model=settings.openai_chat_model,
-        temperature=DEFAULT_TEMPERATURE,
+        temperature=GROUNDED_TEMPERATURE,
         response_format=SectionAnswer,
         messages=[
             {"role": "system", "content": system_prompt},
@@ -134,16 +144,15 @@ async def _answer_from_vector_bm25(query: str, chunks: list[dict[str, Any]]) -> 
         ],
     )
     parsed = resp.choices[0].message.parsed
-    return parsed or SectionAnswer(
-        answer="I could not summarize the matching text passages right now.",
-        sources=sources,
-    )
+    if not parsed or not parsed.answer.strip():
+        return SectionAnswer(answer=NOT_IN_DOC_MESSAGE, sources=[])
+    return parsed
 
 
 async def _answer_from_graph(query: str, triples: list[dict[str, Any]]) -> SectionAnswer:
     if not triples:
         return SectionAnswer(
-            answer="I could not find matching relationship links for this question yet.",
+            answer=NOT_IN_GRAPH_MESSAGE,
             sources=[],
         )
 
@@ -154,8 +163,9 @@ async def _answer_from_graph(query: str, triples: list[dict[str, Any]]) -> Secti
     sources = sorted({f"{t.get('filename', 'Source')} (p. {t.get('page', '?')})" for t in triples})
 
     system_prompt = (
-        "You are a helpful software architect assistant. Explain how components and concepts "
-        "connect in plain, easy-to-follow language based strictly on the provided relationships."
+        "You are a strict graph-grounded assistant. Explain relationships ONLY using the triples in "
+        "[R.C - Retrieved Context]. Do NOT extrapolate or bring in outside knowledge. If the triples "
+        f"do not answer the user's question, respond with: '{NOT_IN_GRAPH_MESSAGE}'"
     )
     augmented_user_msg = _build_augmented_prompt(
         system_prompt,
@@ -165,7 +175,7 @@ async def _answer_from_graph(query: str, triples: list[dict[str, Any]]) -> Secti
 
     resp = await client.beta.chat.completions.parse(
         model=settings.openai_chat_model,
-        temperature=DEFAULT_TEMPERATURE,
+        temperature=GROUNDED_TEMPERATURE,
         response_format=SectionAnswer,
         messages=[
             {"role": "system", "content": system_prompt},
@@ -173,10 +183,9 @@ async def _answer_from_graph(query: str, triples: list[dict[str, Any]]) -> Secti
         ],
     )
     parsed = resp.choices[0].message.parsed
-    return parsed or SectionAnswer(
-        answer="I could not summarize the connected relationships right now.",
-        sources=sources,
-    )
+    if not parsed or not parsed.answer.strip():
+        return SectionAnswer(answer=NOT_IN_GRAPH_MESSAGE, sources=[])
+    return parsed
 
 
 async def run_three_section_query(query: str) -> dict[str, Any]:
@@ -199,9 +208,10 @@ async def run_three_section_query(query: str) -> dict[str, Any]:
     combined_context = "\n".join(chunk_refs + node_refs) or "No retrieved items."
 
     judge_system = (
-        "You are a clear, impartial assistant. Compare the two answers in plain human language, "
-        "choose the best approach ('Vector + BM25', 'Knowledge Graph', or 'Hybrid (Both)'), "
-        "and write a clear, easy-to-read `best_answer` grounded in the context."
+        "You are a strict, grounded assistant. Base `best_answer` ONLY on the retrieved context and "
+        "the two section answers provided. Do NOT add outside facts if the uploaded document does not "
+        f"contain them; if neither section contains relevant facts from the uploaded document, set "
+        f"`best_answer` to '{NOT_IN_DOC_MESSAGE}'."
     )
     judge_prompt = _build_augmented_prompt(
         judge_system,
@@ -219,9 +229,9 @@ async def run_three_section_query(query: str) -> dict[str, Any]:
         ],
     )
     verdict = judge_resp.choices[0].message.parsed or JudgeVerdict(
-        comparison="Both retrieval paths were reviewed together.",
+        comparison="Both retrieval paths were reviewed against the uploaded document.",
         winner="Hybrid (Both)",
-        best_answer=vector_sec.answer or graph_sec.answer,
+        best_answer=NOT_IN_DOC_MESSAGE,
     )
 
     query_terms = {w for w in tokenize(query) if len(w) > 2}
