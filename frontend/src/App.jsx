@@ -2,11 +2,13 @@ import React, { useCallback, useEffect, useState } from "react";
 import WorkspaceHeader from "./components/WorkspaceHeader";
 import PdfSidebar from "./components/PdfSidebar";
 import ComparisonChatTurn from "./components/ComparisonChatTurn";
+import RetrievalTracePanel from "./components/RetrievalTracePanel";
 import ArchitectureExplorerView from "./views/ArchitectureExplorerView";
 import DocumentManagerView from "./views/DocumentManagerView";
 
 const SESSION_STORAGE_KEY = "spotify_architect_rag_turns_v1";
 const MAX_PROMPT_CHARS = 1000;
+const REQUEST_TIMEOUT_MS = 120000;
 
 function extractReadableText(section) {
   if (!section) return "";
@@ -40,6 +42,32 @@ function extractReadableText(section) {
     .replace(/\*\*/g, "")
     .replace(/\n{3,}/g, "\n\n")
     .trim();
+}
+
+function buildTraceFromResponse(data, mode) {
+  const rt = data?.retrieval_trace || {};
+  const chunksCount = Number(
+    rt.chunks_retrieved ?? data?.vector_section?.chunks_retrieved ?? 0
+  );
+  const triplesCount = Number(
+    rt.triples_retrieved ?? data?.graph_section?.triples_retrieved ?? 0
+  );
+  const triples = Array.isArray(rt.triples)
+    ? rt.triples
+    : Array.isArray(data?.graph_section?.triples)
+    ? data.graph_section.triples
+    : [];
+
+  return {
+    mode,
+    vectorScore: Number(rt.vector_score ?? 0),
+    bm25Score: Number(rt.bm25_score ?? 0),
+    chunksRetrieved: chunksCount,
+    triplesRetrieved: triplesCount,
+    hops: Number(rt.graph_hops ?? 0),
+    topMatches: Array.isArray(rt.top_matches) ? rt.top_matches : [],
+    triples,
+  };
 }
 
 function uploadPdfWithProgress(file, onProgress) {
@@ -194,6 +222,9 @@ export default function App() {
       },
     ]);
 
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+
     try {
       const res = await fetch("/api/chat", {
         method: "POST",
@@ -202,6 +233,7 @@ export default function App() {
           query: cleaned,
           mode: retrievalMode,
         }),
+        signal: controller.signal,
       });
       const data = await res.json().catch(() => ({}));
       if (!res.ok) {
@@ -224,20 +256,29 @@ export default function App() {
         return;
       }
 
-      const vectorText = extractReadableText(data.vector_section);
+      const summaryText = extractReadableText(
+        data.comparison_section?.best_answer || data.answer || data.response
+      );
+      const matchesText = extractReadableText(data.vector_section);
       const graphText = extractReadableText(data.graph_section);
-      const comparisonText = extractReadableText(data.comparison_section);
-      const directAnswer = extractReadableText(data.answer || data.response);
 
-      const sections = [
-        vectorText && { label: "Vector & Keyword Match", content: vectorText },
-        graphText && { label: "Connected Architecture", content: graphText },
-        comparisonText && { label: "Key Takeaway", content: comparisonText },
-      ].filter(Boolean);
+      const pageChips = Array.from(
+        new Set(
+          [
+            ...(Array.isArray(data?.vector_section?.sources) ? data.vector_section.sources : []),
+            ...(Array.isArray(data?.graph_section?.sources) ? data.graph_section.sources : []),
+          ].map((s) => {
+            const match = String(s).match(/p\.\s*([0-9]+)/i);
+            return match ? `p.${match[1]}` : String(s);
+          })
+        )
+      ).slice(0, 4);
+
+      const trace = buildTraceFromResponse(data, retrievalMode);
 
       const combinedAnswer =
-        directAnswer ||
-        sections.map((s) => `${s.label}:\n${s.content}`).join("\n\n") ||
+        summaryText ||
+        [matchesText, graphText].filter(Boolean).join("\n\n") ||
         "No response content was returned for this query.";
 
       setTurns((prev) =>
@@ -246,19 +287,29 @@ export default function App() {
             ? {
                 ...t,
                 answer: combinedAnswer,
-                sections,
+                summaryText: summaryText || combinedAnswer,
+                matchesText,
+                graphText,
+                pageChips,
+                hops: trace.hops,
+                trace,
                 loading: false,
               }
             : t
         )
       );
     } catch (err) {
+      const friendlyMessage =
+        err?.name === "AbortError"
+          ? "Request timed out while generating the response. Please tap Retry."
+          : "Connection interrupted while fetching the response. Please check your signal and tap Retry.";
+
       setTurns((prev) =>
         prev.map((t) =>
           t.id === turnId
             ? {
                 ...t,
-                answer: `Unable to fetch response: ${err.message}`,
+                answer: friendlyMessage,
                 error: true,
                 loading: false,
               }
@@ -266,6 +317,7 @@ export default function App() {
         )
       );
     } finally {
+      clearTimeout(timeoutId);
       setIsSending(false);
     }
   };
@@ -307,22 +359,38 @@ export default function App() {
           onOpenMobileMenu={() => setMobileMenuOpen(true)}
         />
 
-        <main className="flex-1 overflow-y-auto">
+        <main className="min-w-0 flex-1 overflow-y-auto">
           {activeView === "chat" && (
-            <div className="mx-auto flex h-full max-w-5xl flex-col justify-between px-4 py-6 md:px-6">
+            <div className="mx-auto flex h-full max-w-6xl flex-col justify-between px-3 py-4 sm:px-6 sm:py-6">
               {turns.length === 0 ? (
                 <div className="my-auto space-y-2 py-8 text-center">
-                  <h2 className="text-xl font-semibold text-white">
+                  <h2 className="text-lg font-semibold text-white sm:text-xl">
                     AI Architect Chat
                   </h2>
-                  <p className="mx-auto max-w-xl text-sm text-emerald-200/75">
-                    Upload a PDF in the sidebar or Indexed PDFs view, then ask your question.
+                  <p className="mx-auto max-w-md text-xs text-emerald-200/75 sm:text-sm">
+                    Upload a PDF in the sidebar or ask a question to inspect Summary, Matches, and Graph results.
                   </p>
                 </div>
               ) : (
-                <div className="space-y-5 pb-6">
+                <div className="space-y-6 pb-4">
                   {turns.map((turn) => (
-                    <ComparisonChatTurn key={turn.id} turn={turn} />
+                    <div
+                      key={turn.id}
+                      className="flex flex-col gap-3 xl:flex-row xl:items-start xl:gap-4"
+                    >
+                      <div className="min-w-0 flex-1">
+                        <ComparisonChatTurn
+                          turn={turn}
+                          onRetry={(q) => submitQuestion(q)}
+                        />
+                      </div>
+
+                      {!turn.loading && !turn.error && turn.trace && (
+                        <div className="w-full xl:w-64 xl:shrink-0">
+                          <RetrievalTracePanel trace={turn.trace} compact />
+                        </div>
+                      )}
+                    </div>
                   ))}
                 </div>
               )}
@@ -334,7 +402,7 @@ export default function App() {
                 }}
                 className="sticky bottom-0 z-10 border-t border-emerald-900/60 bg-[#06100b]/95 pt-3 pb-2 backdrop-blur"
               >
-                <div className="flex items-center gap-2 rounded-xl border border-emerald-800/70 bg-[#0b1d14] p-2">
+                <div className="flex items-center gap-2 rounded-2xl border border-emerald-800/70 bg-[#0b1d14] p-1.5 sm:p-2">
                   <input
                     type="text"
                     value={promptInput}
@@ -344,15 +412,16 @@ export default function App() {
                       setPromptInput(e.target.value);
                       if (inputError) setInputError("");
                     }}
-                    placeholder="Ask a question about your uploaded PDF..."
-                    className="w-full bg-transparent px-2 py-1.5 text-sm text-white placeholder-emerald-200/45 focus:outline-none"
+                    placeholder="Ask about your uploaded PDF..."
+                    className="w-full bg-transparent px-2.5 py-1.5 text-sm text-white placeholder-emerald-200/45 focus:outline-none"
                   />
                   <button
                     type="submit"
                     disabled={isSending || !promptInput.trim()}
-                    className="shrink-0 rounded-lg bg-emerald-500 px-4 py-2 text-xs font-semibold text-slate-950 transition hover:bg-emerald-400 disabled:cursor-not-allowed disabled:opacity-50"
+                    aria-label="Send question"
+                    className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-emerald-400 text-sm font-bold text-slate-950 transition hover:bg-emerald-300 disabled:cursor-not-allowed disabled:opacity-50"
                   >
-                    {isSending ? "Sending..." : "Send"}
+                    {isSending ? "…" : "→"}
                   </button>
                 </div>
                 <div className="mt-1.5 flex items-center justify-between px-1 text-[11px] text-emerald-200/55">
