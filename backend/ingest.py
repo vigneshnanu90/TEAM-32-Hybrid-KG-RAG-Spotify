@@ -184,24 +184,6 @@ def write_triples_to_neo4j(
         return int(record["inserted"]) if record else 0
 
 
-def delete_neo4j_doc_data(doc_id: str) -> int:
-    cypher = """
-    MATCH ()-[r:RELATES {doc_id: $doc_id}]->()
-    WITH count(r) AS deleted_rels
-    MATCH ()-[rel:RELATES {doc_id: $doc_id}]-()
-    DELETE rel
-    WITH deleted_rels
-    MATCH (n:Entity)
-    WHERE NOT (n)--()
-    DELETE n
-    RETURN deleted_rels
-    """
-    with neo4j_driver.session(database=settings.neo4j_database) as session:
-        result = session.run(cypher, doc_id=doc_id)
-        record = result.single()
-        return int(record["deleted_rels"]) if record else 0
-
-
 async def ingest_pdf(pdf_path: Path, original_filename: str) -> dict[str, Any]:
     ensure_storage_dirs()
     doc_id = str(uuid.uuid4())[:8]
@@ -284,11 +266,18 @@ async def ingest_pdf(pdf_path: Path, original_filename: str) -> dict[str, Any]:
 async def delete_document_by_id(doc_id: str) -> dict[str, Any]:
     docs_meta = load_indexed_docs_meta()
     target = next((d for d in docs_meta if d.get("doc_id") == doc_id), None)
+    target_filename = (target or {}).get("filename", "")
 
-    remaining_bm25 = [r for r in load_bm25_records() if r.get("doc_id") != doc_id]
+    def _matches_doc(rec: dict[str, Any]) -> bool:
+        if rec.get("doc_id") == doc_id:
+            return True
+        if target_filename and rec.get("filename") == target_filename:
+            return True
+        return False
+
+    remaining_bm25 = [r for r in load_bm25_records() if not _matches_doc(r)]
     save_bm25_records(remaining_bm25)
 
-    # Rebuild FAISS index from remaining BM25 records, or wipe directory if none remain
     if FAISS_DIR.exists():
         shutil.rmtree(FAISS_DIR, ignore_errors=True)
 
@@ -312,17 +301,33 @@ async def delete_document_by_id(doc_id: str) -> dict[str, Any]:
     neo4j_warning: str | None = None
     deleted_triples = 0
     try:
-        deleted_triples = delete_neo4j_doc_data(doc_id)
+        cypher = """
+        MATCH ()-[rel:RELATES]-()
+        WHERE rel.doc_id = $doc_id
+           OR ($filename <> '' AND rel.filename = $filename)
+        WITH collect(rel) AS target_rels
+        WITH target_rels, size(target_rels) AS deleted_count
+        UNWIND target_rels AS r
+        DELETE r
+        WITH deleted_count
+        MATCH (n:Entity)
+        WHERE NOT (n)--()
+        DELETE n
+        RETURN deleted_count
+        """
+        with neo4j_driver.session(database=settings.neo4j_database) as session:
+            result = session.run(cypher, doc_id=doc_id, filename=target_filename)
+            record = result.single()
+            deleted_triples = int(record["deleted_count"]) if record else 0
     except Exception as exc:
         neo4j_warning = str(exc)
 
     if target and target.get("stored_path"):
         Path(target["stored_path"]).unlink(missing_ok=True)
-    else:
-        for file_path in UPLOADS_DIR.glob(f"{doc_id}_*"):
-            file_path.unlink(missing_ok=True)
+    for file_path in UPLOADS_DIR.glob(f"{doc_id}_*"):
+        file_path.unlink(missing_ok=True)
 
-    updated_docs = [d for d in docs_meta if d.get("doc_id") != doc_id]
+    updated_docs = [d for d in docs_meta if not _matches_doc(d)]
     save_indexed_docs_meta(updated_docs)
 
     return {
