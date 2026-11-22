@@ -1,0 +1,38 @@
+[
+  {
+    "id": "q01",
+    "query": "What is frontend architecture and which Next.js routes are used?",
+    "expected_filenames": ["spotify_web_app_architecture.pdf"],
+    "expected_terms": ["next.js", "route", "frontend"]
+  },
+  {
+    "id": "q02",
+    "query": "What is backend architecture and what services or databases are mentioned?",
+    "expected_filenames": ["spotify_web_app_architecture.pdf"],
+    "expected_terms": ["backend", "nestjs", "api"]
+  },
+  {
+    "id": "q03",
+    "query": "What is Search & Discovery Index Service?",
+    "expected_filenames": ["spotify_web_app_architecture.pdf"],
+    "expected_terms": ["search", "index", "service"]
+  },
+  {
+    "id": "q04",
+    "query": "How does authentication work in the architecture?",
+    "expected_filenames": ["spotify_web_app_architecture.pdf"],
+    "expected_terms": ["oauth2", "oidc", "auth"]
+  },
+  {
+    "id": "q05",
+    "query": "How is deployment handled with Docker, Nginx, and SSL?",
+    "expected_filenames": ["SocialEagle_Deployment_Guide.pdf", "spotify_web_app_architecture.pdf"],
+    "expected_terms": ["docker", "nginx"]
+  },
+  {
+    "id": "q06",
+    "query": "What is Playback & Session Service?",
+    "expected_filenames": ["spotify_web_app_architecture.pdf"],
+    "expected_terms": ["playback", "session"]
+  }
+]

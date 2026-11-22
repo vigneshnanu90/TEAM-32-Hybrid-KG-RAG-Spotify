@@ -5,6 +5,7 @@ from openai import AsyncOpenAI
 from pydantic import BaseModel
 
 from config import settings
+from guardrails import verify_citations
 from ingest import (
     build_bm25_index,
     load_bm25_records,
@@ -154,6 +155,9 @@ async def _answer_from_vector_bm25(
     parsed = resp.choices[0].message.parsed
     if not parsed or not parsed.answer.strip():
         return SectionAnswer(answer=NOT_IN_DOC_MESSAGE, sources=[])
+
+    parsed.answer = verify_citations(parsed.answer, sources)
+    parsed.sources = sources
     return parsed
 
 
@@ -198,6 +202,9 @@ async def _answer_from_graph(
     parsed = resp.choices[0].message.parsed
     if not parsed or not parsed.answer.strip():
         return SectionAnswer(answer=NOT_IN_GRAPH_MESSAGE, sources=[])
+
+    parsed.answer = verify_citations(parsed.answer, sources)
+    parsed.sources = sources
     return parsed
 
 
@@ -267,6 +274,9 @@ async def run_three_section_query(query: str) -> dict[str, Any]:
         best_answer=vector_sec.answer or graph_sec.answer or NOT_IN_DOC_MESSAGE,
     )
     verdict.winner = deterministic_winner
+
+    all_sources = list(dict.fromkeys([*vector_sec.sources, *graph_sec.sources]))
+    verdict.best_answer = verify_citations(verdict.best_answer, all_sources)
 
     query_terms = {w for w in tokenize(query) if len(w) > 2}
     term_hits = sum(

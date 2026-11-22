@@ -2,81 +2,83 @@
 
 ## 1. Executive Summary & System Overview
 
-The **Spotify Hybrid RAG Framework** is a full-stack, mobile-responsive Retrieval-Augmented Generation (RAG) web application engineered to ingest unstructured and semi-structured PDF documents, index them across dense vector, lexical keyword, and property graph stores, and synthesize deterministic, document-grounded answers with live retrieval telemetry.
+The **Spotify Hybrid RAG Framework** is a full-stack, mobile-responsive Retrieval-Augmented Generation (RAG) web application engineered to ingest unstructured and semi-structured documents (`.pdf`, `.md`, `.json`, `.xml`, `.txt`, `.csv`), index them across dense vector, lexical keyword, and property graph stores, and synthesize deterministic, document-grounded answers with verified citations, live retrieval telemetry, and automated evaluation benchmarks.
 
 ### High-Level Tech Stack
 
 * **Frontend:** React 18, Vite, Tailwind CSS, SVG Pointer/Force Graph Canvas, `XMLHttpRequest` + stage polling (real-time backend ingestion progress), and `AbortController` (resilient mobile timeouts).
-* **Backend:** Python 3.11+, FastAPI, Pydantic (Structured Outputs), `pypdf`, `langchain-text-splitters`.
+* **Backend:** Python 3.11+, FastAPI, Pydantic (Structured Outputs), `pypdf`, `langchain-text-splitters`, standard-library `json` / `xml.etree.ElementTree`.
 * **Hybrid Storage & Retrieval Layer:**
+  * **Storage Root (`RAG_STORAGE_DIR`):** Configurable persistent directory (e.g., `backend/storage` locally on Windows or `/app/storage` / `/app/data` in Docker/VPS) holding `faiss_index`, `bm25_docs.pkl`, `indexed_docs.json`, and `uploads`.
   * **Dense Vector Store:** FAISS (`IndexFlatL2`) with OpenAI Embeddings.
   * **Lexical Search Store:** `rank-bm25` (`BM25Okapi`) persisted via pickle (`bm25_docs.pkl`).
   * **Knowledge Graph:** Neo4j Graph Database (`Entity` nodes and `RELATES` directed edges).
-* **LLM & Synthesis:** OpenAI Chat Completions API (`temperature=0.0`) utilizing structured output parsing (`SectionAnswer`, `JudgeVerdict`, `TripleExtractionResult`, `GuardrailDecision`).
-* **Deployment & Infrastructure:** Docker & Docker Compose, Nginx reverse proxy with Let's Encrypt SSL/TLS hosted on a Hostinger VPS (`vickycore.io` and `team-32.vickycore.io`), integrated with GitHub CI/CD (`main` branch).
+* **LLM & Synthesis:** OpenAI Chat Completions API (`temperature=0.0`) utilizing structured output parsing (`SectionAnswer`, `JudgeVerdict`, `TripleExtractionResult`), paired with post-generation citation verification.
+* **Testing, Evaluation & Deployment:** `pytest` unit test suite, `eval_rag.py` automated retrieval benchmark (`docs/EVAL.md`), Docker & Docker Compose, Nginx reverse proxy with Let's Encrypt SSL/TLS hosted on a Hostinger VPS (`vickycore.io` and `team-32.vickycore.io`), integrated with GitHub CI/CD (`main` branch).
 
 ## 2. Alignment with Architectural Design Requirements
 
-The system implements all three architectural blueprints defined during project scoping:
+The system implements the core architectural and engineering practices defined for production RAG and GraphRAG pipelines:
 
-1. **Data Ingestion & Storage Pipeline:**
-   * Supports dynamic PDF upload without hardcoded or pre-seeded sample data.
-   * Splits extracted text into overlapping chunks (`chunk_size=700`, `chunk_overlap=120`), generates embeddings for **FAISS**, tokenizes text for **BM25**, and extracts `(subject, relation, object)` triples via LLM for **Neo4j** (`EE -> RM -> GS`).
-   * Enforces complete data lifecycle management: deleting a PDF purges its chunks from BM25, rebuilds/clears the FAISS index, removes tagged relationships and orphaned nodes in Neo4j, and deletes the raw file from disk.
+1. **Multi-Format Data Ingestion & Storage Pipeline:**
+   * Supports uploading `.pdf` alongside semi-structured and text/data formats (`.md`, `.json`, `.xml`, `.txt`, `.csv`) via `POST /api/upload-pdf` and `POST /api/upload` without hardcoded sample data.
+   * Extracts readable blocks per format (`extract_blocks_from_file`), splits text into overlapping chunks, generates embeddings for **FAISS**, tokenizes text for **BM25**, and extracts `(subject, relation, object)` triples via LLM for **Neo4j** (`EE -> RM -> GS`).
+   * Enforces complete data lifecycle management: deleting a document purges its chunks from BM25, rebuilds/clears the FAISS index, removes tagged relationships and orphaned nodes in Neo4j, and deletes the stored file from disk.
 2. **Hybrid Retrieval, Reranking & Augmentation (`S.P + U.Q + R.C`):**
    * Executes parallel **Vector + BM25** search (fused via Reciprocal Rank Fusion and keyword reranking) alongside **Neo4j Cypher traversal**.
-   * Combines `{Chunks + Node Ref}` with the System Prompt (`S.P`), User Query (`U.Q`), and Retrieved Context (`R.C`) at `temperature=0.0` under strict grounding constraints so answers rely exclusively on the uploaded document's content.
-3. **Production Deployment:**
+   * Combines `{Chunks + Node Ref}` with the System Prompt (`S.P`), User Query (`U.Q`), and Retrieved Context (`R.C`) at `temperature=0.0` under strict grounding and post-generation citation verification so answers rely exclusively on the uploaded content.
+3. **Automated Quality Assurance & Production Deployment:**
+   * Verified by a `pytest` unit test suite (`backend/tests/test_rag_pipeline.py`) and an automated ground-truth evaluation script (`backend/eval_rag.py` outputting `docs/EVAL.md` with Hit@3, Hit@5, and MRR metrics).
    * Version-controlled in GitHub, containerized via multi-stage Docker builds, and served over HTTPS via Nginx on a Linux VPS.
 
 ## 3. Backend Technical Implementation Details
 
-### 3.1 Document Ingestion, Live Progress Jobs & Lifecycle Management (`backend/ingest.py`, `backend/main.py`)
+### 3.1 Multi-Format Ingestion, Live Progress Jobs & Lifecycle Management (`backend/ingest.py`, `backend/main.py`)
 
-When a user uploads a `.pdf` via `POST /api/upload-pdf?job_id=...` (max 50 MB), the backend tracks progress in `INGEST_JOBS` (polled via `GET /api/upload-status/{job_id}`) across deterministic milestones:
+When a user uploads a supported file (`.pdf`, `.md`, `.json`, `.xml`, `.txt`, `.csv`, up to 50 MB) via `POST /api/upload-pdf` or `POST /api/upload` with an optional `job_id`, the backend tracks progress in `INGEST_JOBS` (polled via `GET /api/upload-status/{job_id}`) across deterministic milestones:
 
-1. **Extraction & Chunking (`18%`–`26%`):**
-   * `extract_pdf_pages()` parses text page-by-page using `pypdf.PdfReader`.
-   * `RecursiveCharacterTextSplitter(chunk_size=700, chunk_overlap=120)` breaks page text into semantically coherent chunks tagged with `chunk_id`, `doc_id`, `filename`, and `page`.
-2. **Knowledge Graph Extraction (`30%`–`70%`):**
-   * `extract_triples_from_chunk()` prompts OpenAI (`temperature=0`) with Pydantic schema `TripleExtractionResult` to extract entities (`subject`, `subject_type`, `object`, `object_type`) and normalized `UPPER_SNAKE_CASE` relations (e.g., `USES_TECH`, `PART_OF_LAYER`, `HANDLES`).
-   * `write_triples_to_neo4j()` executes an idempotent `UNWIND` Cypher query using `MERGE` to create `:Entity` nodes and `[:RELATES {type, doc_id, page}]` edges (`ON CREATE SET r.filename = row.filename`), advancing the job percentage proportionally per page.
-3. **Dense Vector Indexing (`75%`):**
-   * Chunks are wrapped as LangChain `Document` objects and embedded using `OpenAIEmbeddings`.
-   * Existing `storage/faiss_index` stores are updated via `aadd_documents()`, or initialized via `FAISS.afrom_documents()` and persisted locally.
-4. **Lexical Indexing (`92%`–`100%`):**
-   * Chunks are appended to `bm25_docs.pkl`. At query time, `tokenize()` normalizes lowercase alphanumeric tokens (`[a-z0-9]+`) to construct an in-memory `BM25Okapi` corpus.
-   * Metadata is saved to `indexed_docs.json` and the job transitions to `100%` (`"Indexing complete"`).
+1. **Validation & Format-Aware Extraction (`18%`–`22%`):**
+   * `is_supported_file()` validates extensions against `{".pdf", ".md", ".json", ".xml", ".txt", ".csv"}`.
+   * `extract_blocks_from_file()` parses `.pdf` page-by-page via `pypdf.PdfReader`, pretty-prints `.json` objects, extracts tags/attributes/text from `.xml` via `xml.etree.ElementTree`, splits `.md` along top-level headings, and reads `.txt`/`.csv` blocks.
+2. **Chunking & Dense/Lexical Indexing (`22%`–`48%`):**
+   * Chunks extracted blocks and tags each chunk with `chunk_id`, `doc_id`, `filename`, and `page`.
+   * Updates or creates the FAISS index under `$RAG_STORAGE_DIR/faiss_index` and appends chunk records to `$RAG_STORAGE_DIR/bm25_docs.pkl`.
+3. **Knowledge Graph Extraction (`72%`–`96%`):**
+   * `_extract_triples_from_chunk()` prompts OpenAI (`temperature=0.0`) with Pydantic schema `TripleExtractionResult` to extract entities (`subject`, `subject_type`, `object`, `object_type`) and normalized `UPPER_SNAKE_CASE` relations.
+   * `_write_triples_to_neo4j()` executes an idempotent `UNWIND` Cypher query using `MERGE` to create `:Entity` nodes and `[:RELATES {type, doc_id, page}]` edges (`SET r.filename = row.filename`), updating job progress per chunk batch.
+4. **Completion & Metadata Persistence (`100%`):**
+   * Records document metadata (`doc_id`, `filename`, `stored_path`, `pages_indexed`, `chunks_indexed`, `triples_stored`) in `$RAG_STORAGE_DIR/indexed_docs.json` and marks the job `completed` at `100%`.
 5. **Cascading Deletion (`delete_document_by_id`):**
-   * Matches records by both `doc_id` and `filename` so no residual chunks or triples remain.
-   * Filters out deleted records from `bm25_docs.pkl`, wipes `faiss_index`, and rebuilds FAISS from remaining records (or leaves it empty when `0` documents remain).
-   * Executes Cypher deletion for matching `RELATES` edges and removes orphaned `:Entity` nodes (`WHERE NOT (n)--()`).
-   * `GET /api/graph` verifies `load_indexed_docs_meta()` and immediately returns an empty graph when `0` PDFs are active.
+   * Matches records by `doc_id` (and `filename` in Neo4j) so no residual chunks or triples remain.
+   * Filters out deleted records from `bm25_docs.pkl`, removes `faiss_index` when empty or rebuilds it from remaining records, deletes matching `RELATES` edges and orphaned `:Entity` nodes in Neo4j, and removes the file from disk.
 
-### 3.2 Input Guardrails (`backend/guardrails.py`)
+### 3.2 Input Guardrails & Post-Generation Citation Verification (`backend/guardrails.py`)
 
-Before running retrieval or LLM synthesis, `check_input_guardrail()` validates every incoming query:
+Every query passes through both pre-retrieval input validation and post-generation citation verification:
 
-* **Length & Empty Validation:** Rejects empty strings and enforces a strict `1,000`-character limit aligned with the frontend input field.
-* **Regex Prompt-Injection Defense:** Blocks instruction-override patterns (e.g., `"ignore previous instructions"`, `"reveal system prompt"`, `"act as root/DAN"`).
-* **Index Readiness Check:** Verifies `has_documents` (`len(load_bm25_records()) > 0`) and instructs the user to upload a PDF if the store is empty.
-* **Semantic Policy Gate:** Uses a zero-temperature LLM classifier (`GuardrailDecision`) to permit legitimate architectural queries while blocking harmful, medical, financial, or legal requests.
+* **Input Validation (`check_input_guardrail`):**
+  * **Length & Empty Validation:** Rejects empty strings and enforces a strict `1,000`-character limit aligned with the frontend input field.
+  * **Regex Prompt-Injection Defense:** Blocks instruction-override patterns (`ignore previous instructions`, `reveal system prompt`, `bypass safety/guardrails/rules`).
+  * **Index Readiness Check:** Verifies `has_documents` and instructs the user to upload a document if the knowledge store is empty.
+* **Post-Generation Citation Verification (`verify_citations`):**
+  * Extracts valid source indices ($1 \dots N$) and allowed page numbers (`p.X`) from the retrieved `sources` list.
+  * Strips any bracketed numeric citations (`[n]`) or page references (`p.X`, `(p. X)`) in the LLM's output that do not map to the actual retrieved chunks or graph triples, normalizing whitespace and punctuation afterward.
 
 ### 3.3 Hybrid Retrieval, RRF Fusion & Deterministic Grounding (`backend/retriever.py`)
 
-`run_three_section_query(query)` orchestrates parallel retrieval and deterministic grounded synthesis:
+`run_three_section_query(query)` orchestrates parallel retrieval, deterministic grounded synthesis, and citation verification:
 
 1. **Vector + BM25 Hybrid Search & Reranking (`_vector_and_bm25_search`):**
-   * **Dense Retrieval:** Queries `FAISS.similarity_search(query, k=5)`.
-   * **Sparse Retrieval:** Scores tokenized query terms against `BM25Okapi` and selects the top 5 positive-scoring chunks.
+   * **Dense Retrieval:** Queries `FAISS.similarity_search(query, k=top_k)`.
+   * **Sparse Retrieval:** Scores tokenized query terms against `BM25Okapi` and selects positive-scoring chunks.
    * **Reciprocal Rank Fusion (RRF):** Combines dense and sparse rankings using:
      $$\text{Score}_{\text{RRF}}(d) = \sum_{r \in \{\text{FAISS}, \text{BM25}\}} \frac{1}{k + \text{rank}_r(d)}, \quad k = 60$$
-   * **Keyword Reranking:** Applies a relevance boost (`+0.02` per matching query token $> 2$ characters) to reorder fused candidates before selecting the top $k=5$ chunks.
+   * **Keyword Reranking:** Applies a relevance boost (`+0.02` per matching query token $> 2$ characters) to reorder fused candidates before selecting the top `top_k` chunks.
 2. **Knowledge Graph Traversal (`_graph_search`):**
    * Extracts up to 6 meaningful keywords ($\text{length} > 2$) from the query and runs a case-insensitive Cypher match across `s.name`, `o.name`, and `r.type` to retrieve up to 20 matching `(subject, relation, object)` triples with source page metadata.
 3. **Deterministic Document-Grounded Synthesis (`S.P + U.Q + R.C`) & Judge Evaluation:**
-   * `_answer_from_vector_bm25` and `_answer_from_graph` run concurrently via `asyncio.gather()` at `GROUNDED_TEMPERATURE = 0.0`, summarizing matching details strictly from `[R.C - Retrieved Context]` without outside knowledge or inconsistent markdown code ticks.
-   * When both vector chunks and graph triples contain relevant hits, `deterministic_winner` is fixed to `"Hybrid (Both)"` (falling back deterministically to `"Knowledge Graph"` or `"Vector + BM25"` when only one path has matches), and `judge_resp` synthesizes `best_answer` at `DEFAULT_TEMPERATURE = 0.0` with consistent overview + bullet formatting.
+   * `_answer_from_vector_bm25` and `_answer_from_graph` run concurrently via `asyncio.gather()` at `GROUNDED_TEMPERATURE = 0.0`, summarizing matching details strictly from `[R.C - Retrieved Context]`, stripping hallucinated citations via `verify_citations()`, and refusing only when retrieved passages/triples contain no relevant facts.
+   * When both vector chunks and graph triples contain relevant hits, `deterministic_winner` is fixed to `"Hybrid (Both)"` (falling back deterministically to `"Knowledge Graph"` or `"Vector + BM25"` when only one path has matches), and `judge_resp` synthesizes `best_answer` at `DEFAULT_TEMPERATURE = 0.0` followed by `verify_citations(verdict.best_answer, all_sources)`.
    * Live telemetry (`retrieval_trace`) returns `vector_score`, `bm25_score`, `chunks_retrieved`, `triples_retrieved`, `graph_hops`, `top_matches`, and `triples` for per-query UI rendering.
 
 ## 4. UI & Frontend Architecture Evolution
@@ -107,39 +109,69 @@ Before running retrieval or LLM synthesis, `check_input_guardrail()` validates e
   * Declutters dense graphs by showing labels for selected nodes, search matches, hovered nodes, immediate neighbors, top hubs, or any node when zoomed past `LABEL_ZOOM = 1.6`, and renders amber relation pills along highlighted edges.
 * **Inspector & One-Click Chat Integration:** Displays the selected node's type, connection count, clickable incoming/outgoing relationship cards with source page numbers, top-hub quick-select buttons when idle, and a direct **Ask AI about this node** input form.
 
-## 5. Issues Encountered & Engineering Resolutions
+## 5. Automated Testing & Retrieval Evaluation (`backend/tests/`, `docs/EVAL.md`)
 
-| # | Issue / Symptom | Root Cause | Resolution Implemented |
+### 5.1 `pytest` Unit Test Suite (`backend/tests/test_rag_pipeline.py`)
+
+Six automated unit tests validate core reliability and safety invariants without requiring live external network calls:
+
+* `test_guardrail_blocks_empty_store`: Verifies queries are blocked with a clear upload prompt when `has_documents=False`.
+* `test_guardrail_blocks_prompt_injection`: Ensures instruction-override strings are blocked by regex guardrails.
+* `test_guardrail_allows_valid_domain_query`: Confirms legitimate architecture queries pass input validation.
+* `test_verify_citations_keeps_valid_and_strips_hallucinated_refs`: Verifies valid citations (`[1]`, `p.1`, `(p. 6)`) are preserved while ungrounded references (`[9]`, `p.42`, `(p. 99)`) are stripped.
+* `test_tokenize_normalizes_punctuation_and_case`: Ensures consistent lowercase alphanumeric tokenization for BM25 and keyword reranking.
+* `test_delete_document_by_id_cleans_bm25_faiss_uploads_and_neo4j`: Uses temporary directories and a mocked Neo4j driver to confirm deleting a document clears BM25 records, metadata, uploaded files, and Neo4j relationships.
+
+### 5.2 Ground-Truth Retrieval Evaluation (`backend/eval_rag.py` & `docs/EVAL.md`)
+
+`eval_rag.py` runs automated retrieval evaluation against `backend/tests/eval_questions.json` and writes a timestamped report to `docs/EVAL.md`:
+
+* **Hit@3:** `100.00%` (6 / 6 queries retrieved a ground-truth relevant chunk in the top 3 results)
+* **Hit@5:** `100.00%` (6 / 6 queries retrieved a ground-truth relevant chunk in the top 5 results)
+* **Mean Reciprocal Rank (MRR):** `0.8889` (5 of 6 queries hit at rank `1`, and 1 query hit at rank `3`)
+
+## 6. Issues Encountered & Engineering Resolutions
+
+| \# | Issue / Symptom | Root Cause | Resolution Implemented |
 | :--- | :--- | :--- | :--- |
 | **1** | **Raw JSON & Escaped Formatting in Chat Output** | Backend structured responses or stringified JSON payloads with literal `\n` and `**` markdown markers rendered directly in UI bubbles. | Built `extractReadableText()` in `App.jsx` to parse JSON strings, extract `best_answer`/`answer`, normalize escaped newlines, and strip markdown artifacts, paired with `FormattedText` bullet rendering in `ComparisonChatTurn.jsx`. |
 | **2** | **Mobile Query Failures (`Load failed`) & Header Wrapping** | Multi-stage hybrid retrieval + LLM calls exceeded mobile browser idle tolerances; narrow screens wrapped header buttons onto multiple lines. | Added an `AbortController` (`120,000 ms` timeout) and `Retry` button in `App.jsx`, and enforced responsive layout rules in `WorkspaceHeader.jsx`. |
 | **3** | **Static / Identical Retrieval Trace Metrics Across Queries** | A single trace panel was pinned at the top of the page and populated with estimated scores based solely on chunk count (`0.87` / `0.68`). | Added real `retrieval_trace` telemetry (RRF/keyword scores, top chunk previews, distinct relation hops, and live triples) to `retriever.py` and rendered a dedicated `RetrievalTracePanel` beside each individual chat turn. |
-| **4** | **Residual Graph/Chunk Data After Deleting a PDF** | Deleting a PDF only matched `doc_id` in some stores or left orphaned Neo4j edges visible in `GET /api/graph` even when `0 PDFs` were indexed. | Updated `delete_document_by_id()` to match by both `doc_id` and `filename` across BM25, FAISS, and Neo4j (including orphan node cleanup), and updated `GET /api/graph` to return empty results immediately when `indexed_docs.json` is empty. |
-| **5** | **LLM Off-Topic Hallucinations vs. Over-Refusal** | Initial prompts allowed pre-trained knowledge on unrelated PDFs; an initial strict pass caused over-refusal on valid backend architecture queries. | Balanced prompts in `retriever.py` so the LLM summarizes matching facts directly from `[R.C - Retrieved Context]` and only refuses when retrieved passages/triples contain no relevant facts. |
+| **4** | **Residual Graph/Chunk Data After Deleting a Document** | Deleting a file only matched `doc_id` in some stores or left orphaned Neo4j edges visible in `GET /api/graph` even when `0` documents were indexed. | Updated `delete_document_by_id()` to match by both `doc_id` and `filename` across BM25, FAISS, and Neo4j (including orphan node cleanup), and updated `GET /api/graph` to return empty results immediately when `indexed_docs.json` is empty. |
+| **5** | **LLM Off-Topic Hallucinations, Over-Refusal & Unverified Citations** | Initial prompts allowed pre-trained knowledge on unrelated documents; an initial strict pass caused over-refusal, and responses lacked post-generation citation validation. | Balanced prompts in `retriever.py` so the LLM summarizes matching facts directly from `[R.C - Retrieved Context]` and added `verify_citations()` in `guardrails.py` to strip any `[n]` or `p.X` reference not present in retrieved sources. |
 | **6** | **Upload Progress Jumping Immediately to `100%`** | `xhr.upload.onprogress` only tracked browser-to-server network transfer, hitting `100%` before backend splitting, Neo4j extraction, and embedding finished. | Added server-side `INGEST_JOBS` tracking (`GET /api/upload-status/{job_id}`) in `ingest.py`/`main.py` and paired `0%–15%` network upload with `700 ms` stage polling in `App.jsx`, `PdfSidebar.jsx`, and `DocumentManagerView.jsx`. |
 | **7** | **Node Clumping in Knowledge Graph Visualization** | Initial physics pulled nodes toward the center without island separation or collision avoidance, causing nodes and labels to overlap. | Rebuilt `ArchitectureExplorerView.jsx` with connected-component island packing (`layoutIslands`), force-directed repulsion + collision resolution (`tickSimulation`), zoom/pan/drag gestures, type filter pills, and hub-based label decluttering. |
 | **8** | **Inconsistent Winner & Formatting on Repeated Identical Queries** | Judge and section LLM calls sampled at `temperature=0.5`/`0.3` without a deterministic winner tie-breaker, flipping between prose/bullets and `Graph` vs. `Vector` winners. | Set `DEFAULT_TEMPERATURE = 0.0` and `GROUNDED_TEMPERATURE = 0.0` in `retriever.py` and enforced deterministic `winner` selection and consistent formatting. |
 | **9** | **Mode Mismatch in Loading Text & Mixed Results in Vector/Graph Modes** | Loading status hardcoded `"Running hybrid retrieval..."` and `ComparisonChatTurn` displayed all three tabs (`Best Match`, `Vector`, `Graph`) even when `Vector` or `Graph` mode was selected. | Updated `WorkspaceHeader.jsx`, `ComparisonChatTurn.jsx`, `App.jsx`, and `index.html` to reflect the active mode in the title and loading indicator, and isolated `Vector` and `Graph` modes so each displays only its respective result. |
+| **10** | **PDF-Only Upload Restriction & `RAG_STORAGE_DIR` Path Mismatch During Eval** | Uploads were restricted to `.pdf`, and running `eval_rag.py` without `RAG_STORAGE_DIR` pointing to `backend/storage` read an empty directory (`0.00%` metrics). | Added `.pdf`, `.md`, `.json`, `.xml`, `.txt`, and `.csv` support in `ingest.py`, `main.py`, and UI file pickers, and aligned `RAG_STORAGE_DIR` with `backend/storage` (`100.00%` Hit@3/Hit@5, `0.8889` MRR). |
 
-## 6. Deployment & Verification Workflow
+## 7. Deployment & Verification Workflow
 
 ### Local Development (Windows / Docker Desktop)
 
 1. Start **Docker Desktop** and confirm the Linux engine status is **Engine running**.
-2. Ensure `backend/.env` contains valid `OPENAI_API_KEY`, `NEO4J_URI`, `NEO4J_USERNAME`, and `NEO4J_PASSWORD` credentials.
+2. Ensure `backend/.env` contains valid `OPENAI_API_KEY`, `NEO4J_URI`, `NEO4J_USERNAME`, `NEO4J_PASSWORD`, and `RAG_STORAGE_DIR` (pointing to your local `backend/storage` directory on Windows).
 3. Build and start the containers:
-   ```bash
-   docker compose up --build -d
-   docker compose ps
-   ```
-4. Verify locally at `http://localhost`:
-   * Upload a `.pdf` and verify real-time stage progress (`Upload`, `Split Text`, `Graph Nodes`, `FAISS & BM25`) before hitting `100%`.
-   * Test **Hybrid** (`Best Match`, `Vector`, `Graph`), **Vector** (Vector result only), and **Graph** (Graph result only) modes, and ask identical queries twice to confirm consistent answers.
-   * Open **Tech Stack & Services** to test island-packed force layout, node dragging, zoom/pan, type filter pills, and node inspection.
-   * Delete the uploaded PDF and verify `0 PDFs` and `0 Nodes` / `0 Edges`.
 
-### Production VPS Deployment (`vickycore.io` / `team-32.vickycore.io`)
+```bash
+docker compose up --build -d
+docker compose ps
+```
 
-1. Commit and push verified changes to `main` on GitHub (`git add . && git commit -m "..." && git push origin main`).
-2. Automated GitHub Actions (or SSH pull + `docker compose up --build -d`) updates the containers on the Hostinger VPS behind Nginx and Let's Encrypt SSL.
-3. Confirm service health via `https://team-32.vickycore.io/api/health` and verify both desktop and mobile viewports.
+4. Run automated unit tests and retrieval evaluation from `backend/` (with `RAG_STORAGE_DIR` set to `backend/storage`):
+
+```bash
+pytest -v
+python eval_rag.py
+```
+
+5. Verify locally at `http://localhost`:
+   * Upload a `.pdf` or supported `.md` / `.json` / `.xml` / `.txt` / `.csv` file and verify real-time stage progress (`Upload`, `Split Text`, `Graph Nodes`, `FAISS & BM25`).
+   * Switch between **Hybrid**, **Vector**, and **Graph** modes to confirm isolated views and per-query retrieval traces.
+   * Open the **Live Knowledge Graph** to pan, zoom, drag nodes, filter by type, and click **Ask AI about this node**.
+   * Delete an indexed document and verify that chunks, graph nodes/edges, and stored uploads are cleanly purged.
+
+### Production VPS Deployment (`vickycore.io` & `team-32.vickycore.io`)
+
+1. Commit and push changes to `main` on GitHub (`git push origin main`) to trigger `.github/workflows/deploy.yml` (or run `git pull origin main && docker compose up --build -d` directly on the VPS).
+2. Confirm containers are healthy (`docker compose ps`) and verify live HTTPS responses across `https://team-32.vickycore.io`.
